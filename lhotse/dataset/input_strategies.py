@@ -1,5 +1,6 @@
 import logging
 from typing import Callable, Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -19,6 +20,13 @@ class InputStrategy:
 
     .. automethod:: __call__
     """
+    def __init__(self, threads: int=1):
+        if threads < 1:
+            logging.warning(f'InputStrategy threads were set to {threads}. Using 1 thread instead')
+        elif threads == 1:
+            self._thread_pool_ex = None
+        else:
+            self._thread_pool_ex = ThreadPoolExecutor(threads)
 
     def __call__(self, cuts: CutSet) -> Tuple[torch.Tensor, torch.IntTensor]:
         """Returns a tensor with collated input signals, and a tensor of length of each signal before padding."""
@@ -78,13 +86,19 @@ class PrecomputedFeatures(InputStrategy):
     .. automethod:: __call__
     """
 
+    def __init__(
+            self,
+            threads: int=1
+    ):
+        super().__init__(threads=threads)
+
     def __call__(self, cuts: CutSet) -> Tuple[torch.Tensor, torch.IntTensor]:
         """
         Reads the pre-computed features from disk/other storage.
         The returned shape is ``(B, T, F) => (batch_size, num_frames, num_features)``.
 
         :return: a tensor with collated features, and a tensor of ``num_frames`` of each cut before padding."""
-        return collate_features(cuts)
+        return collate_features(cuts, thread_pool=self._thread_pool_ex)
 
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
         """
@@ -199,7 +213,8 @@ class OnTheFlyFeatures(InputStrategy):
     def __init__(
             self,
             extractor: FeatureExtractor,
-            wave_transforms: List[Callable[[torch.Tensor], torch.Tensor]] = None
+            wave_transforms: List[Callable[[torch.Tensor], torch.Tensor]] = None,
+            threads: int=1,
     ) -> None:
         """
         OnTheFlyFeatures' constructor.
@@ -208,6 +223,8 @@ class OnTheFlyFeatures(InputStrategy):
         :param wave_transforms: an optional list of transforms applied on the batch of audio
             waveforms collated into a single tensor, right before the feature extraction.
         """
+
+        super().__init__(threads=threads)
         self.extractor = extractor
         self.wave_transforms = ifnone(wave_transforms, [])
 
@@ -219,6 +236,9 @@ class OnTheFlyFeatures(InputStrategy):
 
         :return: a tensor with collated features, and a tensor of ``num_frames`` of each cut before padding.
         """
+
+        logging.error('OPLATEK make use of thread_pool_ex')  # TODO
+
         audio, _ = collate_audio(cuts)
 
         for tfnm in self.wave_transforms:

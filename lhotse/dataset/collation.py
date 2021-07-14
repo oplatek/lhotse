@@ -1,4 +1,5 @@
-from typing import Iterable, List, Tuple, Union
+from typing import Iterable, List, Tuple, Union, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -101,7 +102,8 @@ class TokenCollater:
 
 def collate_features(
         cuts: CutSet,
-        pad_direction: str = 'right'
+        pad_direction: str = 'right',
+        thread_pool: Optional[ThreadPoolExecutor] = None,
 ) -> Tuple[torch.Tensor, torch.IntTensor]:
     """
     Load features for all the cuts and return them as a batch in a torch tensor.
@@ -117,8 +119,12 @@ def collate_features(
     cuts = maybe_pad(cuts, num_frames=max(features_lens).item(), direction=pad_direction)
     first_cut = next(iter(cuts))
     features = torch.empty(len(cuts), first_cut.num_frames, first_cut.num_features)
-    for idx, cut in enumerate(cuts):
-        features[idx] = torch.from_numpy(cut.load_features())
+    mapf = thread_pool.map if thread_pool else map
+    feats_arr = mapf(
+            lambda cut: torch.from_numpy(cut.load_features()),
+            cuts)
+    for idx, feats in enumerate(feats_arr):
+        features[idx] = feats
     return features, features_lens
 
 
