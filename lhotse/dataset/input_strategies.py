@@ -23,10 +23,25 @@ class InputStrategy:
     def __init__(self, threads: int=1):
         if threads < 1:
             logging.warning(f'InputStrategy threads were set to {threads}. Using 1 thread instead')
-        elif threads == 1:
-            self._thread_pool_ex = None
+            self._threads = 1
+        self._threads = threads
+        self._thread_pool_ex = None
+        assert isinstance(self._threads, int), f'Expected int: {type(self._threds)}'
+
+    def set_thread_pool_ex(self, p: Optional[ThreadPoolExecutor] = None):
+        if self._thread_pool_ex:
+            self._thread_pool_ex.shutdown()
+
+        if p is not None:
+            self._thread_pool_ex = p
+        elif self._threads > 1:
+            self._thread_pool_ex = ThreadPoolExecutor(self._thread_pool_ex)
         else:
-            self._thread_pool_ex = ThreadPoolExecutor(threads)
+            self._thread_pool_ex = None
+
+    def __del__(self):
+        if self._thread_pool_ex:
+            self._thread_pool_ex.shutdown()
 
     def __call__(self, cuts: CutSet) -> Tuple[torch.Tensor, torch.IntTensor]:
         """Returns a tensor with collated input signals, and a tensor of length of each signal before padding."""
@@ -98,6 +113,8 @@ class PrecomputedFeatures(InputStrategy):
         The returned shape is ``(B, T, F) => (batch_size, num_frames, num_features)``.
 
         :return: a tensor with collated features, and a tensor of ``num_frames`` of each cut before padding."""
+        if self._thread_pool_ex is None and self._threads >  1:
+            self.set_thread_pool_ex()
         return collate_features(cuts, thread_pool=self._thread_pool_ex)
 
     def supervision_intervals(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
