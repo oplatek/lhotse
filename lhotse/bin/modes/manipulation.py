@@ -64,7 +64,8 @@ def split(num_splits: int, manifest: Pathlike, output_dir: Pathlike, shuffle: bo
     "--cutids",
     type=str,
     help=(
-        "A json string or path to json file containing array of cutids strings. "
+        "A json string or CutSet manifest "
+        "or path to json file containing array of cutids strings. "
         'E.g. --cutids \'["cutid1", "cutid2"]\'.'
     ),
 )
@@ -84,11 +85,15 @@ def subset(
 
     cids = None
     if cutids is not None:
-        if os.path.exists(cutids):
-            with open(cutids, "rt") as r:
-                cids = json.load(r)
-        else:
+        if not os.path.exists(cutids):
             cids = json.loads(cutids)
+        else:
+            try:
+                cutset = load_manifest(cutids, manifest_cls=CutSet)
+                cids = [c.id for c in cutset]
+            except ValueError:
+                with open(cutids, "rt") as r:
+                    cids = json.load(r)
 
     if isinstance(any_set, CutSet):
         a_subset = any_set.subset(first=first, last=last, cut_ids=cids)
