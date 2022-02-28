@@ -33,6 +33,15 @@ def prepare_bvcc(
     phase1_main = (corpus_dir / "phase1-main").resolve()
     assert phase1_main.exists(), f"Main track dir is missing {phase1_main}"
 
+    testphase_distribution = (corpus_dir / "testphase-distribution").resolve()
+    assert (
+        testphase_distribution.exists()
+    ), f"Test data is missing {testphase_distribution}"
+
+    # The data points to already downloaded with main and test data
+    test_main_scp = testphase_distribution / "main" / "test.scp"
+    assert test_main_scp.exists(), str(test_main_scp)
+
     main1_sets = phase1_main / "DATA" / "sets"
     main1_wav = phase1_main / "DATA" / "wav"
     assert (
@@ -60,6 +69,7 @@ def prepare_bvcc(
     manifests = {}
 
     # ### Main track sets
+
     main1_recs = RecordingSet.from_dir(main1_wav, pattern="*.wav", num_jobs=num_jobs)
 
     logging.info("Preparing main1_dev")
@@ -88,6 +98,16 @@ def prepare_bvcc(
     manifests["main1_train"] = {
         "recordings": main1_train_recs,
         "supervisions": main1_train_sup,
+    }
+
+    # test_main_scp has recording id per line e.g. "sys00991-utt2353357.wav"
+    test_recording_ids = [line.strip()[:-4] for line in open(test_main_scp).readlines()]
+    test_main_recordings = main1_recs.filter(lambda r: r.id in test_recording_ids)
+    assert len(test_main_recordings) == len(
+        test_recording_ids
+    ), f"{len(test_main_recordings)} != {len(test_recording_ids)}"
+    manifests["main1_test"] = {
+        "recordings": test_main_recordings,
     }
 
     # ### Out of Domain (OOD) track sets
