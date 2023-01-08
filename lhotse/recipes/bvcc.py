@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Union
+import shutil
+import tarfile
 
 from lhotse import (
     Recording,
@@ -9,19 +11,41 @@ from lhotse import (
     SupervisionSet,
     validate_recordings_and_supervisions,
 )
-from lhotse.utils import Pathlike
+from lhotse.utils import Pathlike, urlretrieve_progress
 
 
-def download_bvcc(target_dir) -> None:
-    print(
-        """
-    Unfortunately you need to download the data manually due to licensing reason.
+def download_bvcc(
+    target_dir: Pathlike = ".",
+    force_download: bool = False,
+    base_url: str = "https://zenodo.org/record/6572573/files/",
+) -> None:
+    main_tar_name = "main.tar.gz"
+    ood_tar_name = "ood.tar.gz"
 
-    See info and instructions how to obtain BVCC dataset used for VoiceMOS challange:
-    - https://arxiv.org/abs/2105.02373
-    - https://nii-yamagishilab.github.io/ecooper-demo/VoiceMOS2022/index.html
-    - https://codalab.lisn.upsaclay.fr/competitions/695"""
-    )
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    corpus_dir = target_dir / "BVCC"
+
+    for tar_name in [ood_tar_name, main_tar_name]:
+        tar_path = target_dir / tar_name
+        extracted_dir = corpus_dir / tar_name[:-7]
+        completed_detector = extracted_dir / ".completed"
+        if completed_detector.is_file():
+            logging.info(f"Skipping download of because {completed_detector} exists.")
+            continue
+        if force_download or not tar_path.is_file():
+            urlretrieve_progress(
+                f"{base_url}/{tar_name}",
+                filename=tar_path,
+                desc=f"Downloading {tar_name}",
+            )
+        shutil.rmtree(extracted_dir, ignore_errors=True)
+        with tarfile.open(tar_path) as tar:
+            tar.extractall(path=corpus_dir)
+        completed_detector.touch()
+
+    return corpus_dir
 
 
 def prepare_bvcc(
@@ -31,126 +55,57 @@ def prepare_bvcc(
 ) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
     corpus_dir = Path(corpus_dir)
 
-    phase1_main = (corpus_dir / "phase1-main").resolve()
-    assert phase1_main.exists(), f"Main track dir is missing {phase1_main}"
+    recs = {}
+    for track in ["main", "ood"]:
+        track_dir = (corpus_dir / track).resolve()
+        assert track_dir.exists(), f"{track} track dir is missing {track_dir}"
+        track_sets = track_dir / "DATA" / "sets"
+        track_wav = track_dir / "DATA" / "wav"
+        assert (
+            track_sets.exists() and track_wav.exists()
+        ), f"Have you run data preparation in {track_dir}?"
 
-    main1_sets = phase1_main / "DATA" / "sets"
-    main1_wav = phase1_main / "DATA" / "wav"
-    assert (
-        main1_sets.exists() and main1_wav.exists()
-    ), f"Have you run data preparation in {phase1_main}?"
-    main1_devp = main1_sets / "DEVSET"
-    assert main1_devp.exists(), main1_devp
-    main1_trainp = main1_sets / "TRAINSET"
-    assert main1_trainp.exists(), main1_trainp
-    main1_testp = main1_sets / "test.scp"
-    assert main1_testp.exists(), main1_testp
+        # for split in ["test", "dev", "train"]:
+        for split in ["dev", "train"]:
+            splitp = track_sets / f"{split.upper()}SET"
+            assert splitp.exists(), splitp
+        recs[track] = RecordingSet.from_dir(
+            track_wav, pattern="*.wav", num_jobs=num_jobs
+        )
 
-    phase1_ood = (corpus_dir / "phase1-ood").resolve()
-    assert phase1_ood.exists(), f"Out of domain track dir is missing {phase1_ood}"
-    ood1_sets = phase1_ood / "DATA" / "sets"
-    ood1_wav = phase1_ood / "DATA" / "wav"
-    assert (
-        ood1_sets.exists() and ood1_wav.exists()
-    ), f"Have you run data preparation in {phase1_ood}?"
-    ood1_unlabeledp = ood1_sets / "unlabeled_mos_list.txt"
-    assert ood1_unlabeledp.exists(), ood1_unlabeledp
-    ood1_devp = ood1_sets / "DEVSET"
-    assert ood1_devp.exists(), ood1_devp
-    ood1_trainp = ood1_sets / "TRAINSET"
-    assert ood1_trainp.exists(), ood1_devp
-    ood1_testp = ood1_sets / "test.scp"
-    assert ood1_testp.exists(), ood1_testp
+    ood_unlabeledp = (corpus_dir / "ood/DATA/sets/unlabeled_mos_list.txt").resolve()
+    assert ood_unlabeledp.exists(), ood_unlabeledp
 
     manifests = {}
+    for track in ["main", "ood"]:
+        # for split in ["test", "dev", "train"]:
+        for split in ["dev", "train"]:
+            logging.info(f"Preparing {track}_{split}")
+            track_splitp = track_sets / f"{split.upper()}SET"
+            __import__("ipdb").set_trace()
+            parse_line = parse_main_line if track == "main" else parse_ood_line
+            track_split_sup = SupervisionSet.from_segments(
+                gen_supervision_per_utt(
+                    sorted(open(track_splitp).readlines()),
+                    recs[track],
+                    parse_line,
+                )
+            )
+            track_split_recs = recs[track].filter(lambda rec: rec.id in track_split_sup)
+            manifests[f"track_{split}"] = {
+                "recordings": track_split_recs,
+                "supervisions": track_split_sup,
+            }
 
-    # ### Main track sets
-    main1_recs = RecordingSet.from_dir(main1_wav, pattern="*.wav", num_jobs=num_jobs)
-
-    logging.info("Preparing main1_dev")
-    main1_dev_sup = SupervisionSet.from_segments(
-        gen_supervision_per_utt(
-            sorted(open(main1_devp).readlines()),
-            main1_recs,
-            parse_main_line,
-        )
-    )
-    main1_dev_recs = main1_recs.filter(lambda rec: rec.id in main1_dev_sup)
-    manifests["main1_dev"] = {
-        "recordings": main1_dev_recs,
-        "supervisions": main1_dev_sup,
-    }
-
-    logging.info("Preparing main1_train")
-    main1_train_sup = SupervisionSet.from_segments(
-        gen_supervision_per_utt(
-            sorted(open(main1_trainp).readlines()),
-            main1_recs,
-            parse_main_line,
-        )
-    )
-    main1_train_recs = main1_recs.filter(lambda rec: rec.id in main1_train_sup)
-    manifests["main1_train"] = {
-        "recordings": main1_train_recs,
-        "supervisions": main1_train_sup,
-    }
-
-    main1_test_wavpaths = [
-        main1_wav / name.strip() for name in open(main1_testp).readlines()
-    ]
-    manifests["main1_test"] = {
-        "recordings": RecordingSet.from_recordings(
-            Recording.from_file(p) for p in main1_test_wavpaths
-        )
-    }
-
-    # ### Out of Domain (OOD) track sets
+    # Add unlabeled OOD dev data
+    ood_wav = (corpus_dir / "ood/DATA/wav").resolve()
     unlabeled_wavpaths = [
-        ood1_wav / name.strip() for name in open(ood1_unlabeledp).readlines()
+        ood_wav / name.strip() for name in open(ood_unlabeledp).readlines()
     ]
-    manifests["ood1_unlabeled"] = {
+    manifests["ood_unlabeled"] = {
         "recordings": RecordingSet.from_recordings(
             Recording.from_file(p) for p in unlabeled_wavpaths
         )
-    }
-
-    ood1_test_wavpaths = [
-        ood1_wav / name.strip() for name in open(ood1_testp).readlines()
-    ]
-    manifests["ood1_test"] = {
-        "recordings": RecordingSet.from_recordings(
-            Recording.from_file(p) for p in ood1_test_wavpaths
-        )
-    }
-
-    ood1_recs = RecordingSet.from_dir(ood1_wav, pattern="*.wav", num_jobs=num_jobs)
-
-    logging.info("Preparing ood1_dev")
-    ood1_dev_sup = SupervisionSet.from_segments(
-        gen_supervision_per_utt(
-            sorted(open(ood1_devp).readlines()),
-            ood1_recs,
-            parse_ood_line,
-        )
-    )
-    ood1_dev_recs = ood1_recs.filter(lambda rec: rec.id in ood1_dev_sup)
-    manifests["ood1_dev"] = {
-        "recordings": ood1_dev_recs,
-        "supervisions": ood1_dev_sup,
-    }
-
-    logging.info("Preparing ood1_train")
-    ood1_train_sup = SupervisionSet.from_segments(
-        gen_supervision_per_utt(
-            sorted(open(ood1_trainp).readlines()),
-            ood1_recs,
-            parse_ood_line,
-        )
-    )
-    ood1_train_recs = ood1_recs.filter(lambda rec: rec.id in ood1_train_sup)
-    manifests["ood1_train"] = {
-        "recordings": ood1_train_recs,
-        "supervisions": ood1_train_sup,
     }
 
     # Optionally serializing to disc
@@ -185,16 +140,18 @@ def parse_main_line(line):
     sysid, uttid, rating, _ignore, listenerinfo = line.split(",")
     _, agerange, listenerid, listener_mf, _, _, haveimpairment = listenerinfo.split("_")
 
-    assert listener_mf in ["Male", "Female", "Others"], listener_mf
+    assert listener_mf in ["Male", "Female", "Others", "na"], listener_mf
     if listener_mf == "Male":
         listener_mf = "M"
     elif listener_mf == "Female":
         listener_mf = "F"
     elif listener_mf == "Others":
         listener_mf = "O"
+    elif listener_mf == "na":
+        listener_mf = "na"
     else:
         ValueError(f"Unsupported value {listener_mf}")
-    assert haveimpairment in ["Yes", "No"], haveimpairment
+    assert haveimpairment in ["EP", "ER", "EE", "Yes", "No"], haveimpairment
     haveimpairment = haveimpairment == "Yes"
 
     return (
@@ -278,6 +235,7 @@ def segment_from_run(infos, recordings):
             sysidA = sysid
         else:
             assert sysid == sysidA, f"{sysid} vs {sysidA}"
+    __import__("ipdb").set_trace()
     if uttidA is not None:
         assert sysidA is not None and len(MOSd) > 0 and len(LISTENERsd) > 0
         if uttidA.endswith(".wav"):
