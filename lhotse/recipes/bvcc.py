@@ -65,8 +65,8 @@ def prepare_bvcc(
             track_sets.exists() and track_wav.exists()
         ), f"Have you run data preparation in {track_dir}?"
 
-        # for split in ["test", "dev", "train"]:
-        for split in ["dev", "train"]:
+        for split in ["test", "dev", "train"]:
+            # for split in ["dev", "train"]:
             splitp = track_sets / f"{split.upper()}SET"
             assert splitp.exists(), splitp
         recs[track] = RecordingSet.from_dir(
@@ -77,12 +77,13 @@ def prepare_bvcc(
     assert ood_unlabeledp.exists(), ood_unlabeledp
 
     manifests = {}
+
     for track in ["main", "ood"]:
-        # for split in ["test", "dev", "train"]:
-        for split in ["dev", "train"]:
+        for split in ["unlabeled", "test", "dev", "train"]:
+            if track == "main" and split == "unlabeled":
+                continue  # unlabeled is present only on ood track
             logging.info(f"Preparing {track}_{split}")
-            track_splitp = track_sets / f"{split.upper()}SET"
-            __import__("ipdb").set_trace()
+            track_splitp = corpus_dir / track / "DATA" / "sets" / f"{split.upper()}SET"
             parse_line = parse_main_line if track == "main" else parse_ood_line
             track_split_sup = SupervisionSet.from_segments(
                 gen_supervision_per_utt(
@@ -92,21 +93,10 @@ def prepare_bvcc(
                 )
             )
             track_split_recs = recs[track].filter(lambda rec: rec.id in track_split_sup)
-            manifests[f"track_{split}"] = {
+            manifests[f"{track}_{split}"] = {
                 "recordings": track_split_recs,
                 "supervisions": track_split_sup,
             }
-
-    # Add unlabeled OOD dev data
-    ood_wav = (corpus_dir / "ood/DATA/wav").resolve()
-    unlabeled_wavpaths = [
-        ood_wav / name.strip() for name in open(ood_unlabeledp).readlines()
-    ]
-    manifests["ood_unlabeled"] = {
-        "recordings": RecordingSet.from_recordings(
-            Recording.from_file(p) for p in unlabeled_wavpaths
-        )
-    }
 
     # Optionally serializing to disc
     if output_dir is not None:
@@ -235,7 +225,6 @@ def segment_from_run(infos, recordings):
             sysidA = sysid
         else:
             assert sysid == sysidA, f"{sysid} vs {sysidA}"
-    __import__("ipdb").set_trace()
     if uttidA is not None:
         assert sysidA is not None and len(MOSd) > 0 and len(LISTENERsd) > 0
         if uttidA.endswith(".wav"):
