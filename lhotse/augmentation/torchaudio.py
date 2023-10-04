@@ -1,13 +1,12 @@
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import ROUND_HALF_UP
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
 from lhotse.augmentation.transform import AudioTransform
-from lhotse.augmentation.utils import convolve1d
 from lhotse.utils import (
     Seconds,
     compute_num_samples,
@@ -310,99 +309,6 @@ class Volume(AudioTransform):
         """
         This method just returnes the original offset and duration as volume perturbation
         doesn't change any these audio properies.
-        """
-
-        return offset, duration
-
-
-@dataclass
-class ReverbWithImpulseResponse(AudioTransform):
-    """
-    Reverberation effect by convolving with a room impulse response.
-    This code is based on Kaldi's wav-reverberate utility:
-    https://github.com/kaldi-asr/kaldi/blob/master/src/featbin/wav-reverberate.cc
-
-    The impulse response can possibly be multi-channel, in which case multi-channel reverberated
-    audio can be obtained by appropriately setting `rir_channels`. For example, `rir_channels=[0,1]`
-    will convolve using the first two channels of the impulse response, generating a stereo
-    reverberated audio.
-    Note that we enforce the --shift-output option in Kaldi's wav-reverberate utility,
-    which means that the output length will be equal to the input length.
-    """
-
-    rir: dict
-    normalize_output: bool = True
-    early_only: bool = False
-    rir_channels: List[int] = field(default_factory=lambda: [0])
-
-    RIR_SCALING_FACTOR: float = 0.5**15
-
-    def __post_init__(self):
-        if isinstance(self.rir, dict):
-            from lhotse import Recording
-
-            # Pass a shallow copy of the RIR dict since `from_dict()` pops the `sources` key.
-            self.rir = Recording.from_dict(self.rir.copy())
-        assert all(
-            c < self.rir.num_channels for c in self.rir_channels
-        ), "Invalid channel index in `rir_channels`"
-
-    def __call__(
-        self,
-        samples: np.ndarray,
-        sampling_rate: int,
-    ) -> np.ndarray:
-        """
-        :param samples: The audio samples to reverberate (must be single-channel).
-        :param sampling_rate: The sampling rate of the audio samples.
-        """
-        assert samples.shape[0] == 1, "The input audio must be single-channel."
-        sampling_rate = int(sampling_rate)  # paranoia mode
-
-        rir_ = (
-            self.rir.load_audio(channels=self.rir_channels)
-            if not self.early_only
-            else self.rir.load_audio(duration=0.05)
-        )
-
-        # Determine output length.
-        _, N_in = samples.shape
-        D, N_rir = rir_.shape
-        N_out = N_in  # Enforce shift output
-
-        # Initialize output matrix with the specified input channel.
-        augmented = np.zeros((D, N_out), dtype=samples.dtype)
-        power_before_reverb = np.sum(np.abs(samples) ** 2) / samples.shape[1]
-
-        for d in range(D):
-            augmented[d, :N_in] = samples
-            rir_d = rir_[d, :] * self.RIR_SCALING_FACTOR
-
-            # Convolve the signal with impulse response.
-            aug_d = convolve1d(
-                torch.from_numpy(samples[0]), torch.from_numpy(rir_d)
-            ).numpy()
-            shift_index = np.argmax(rir_d)
-            augmented[d, :] = aug_d[shift_index : shift_index + N_out]
-
-            if self.normalize_output:
-                power_after_reverb = (
-                    np.sum(np.abs(augmented[d, :]) ** 2) / augmented.shape[1]
-                )
-                if power_after_reverb > 0:
-                    augmented[d, :] *= np.sqrt(power_before_reverb / power_after_reverb)
-
-        return augmented
-
-    def reverse_timestamps(
-        self,
-        offset: Seconds,
-        duration: Optional[Seconds],
-        sampling_rate: Optional[int],  # Not used, made for compatibility purposes
-    ) -> Tuple[Seconds, Optional[Seconds]]:
-        """
-        This method just returns the original offset and duration since we have
-        implemented output shifting which preserves these properties.
         """
 
         return offset, duration

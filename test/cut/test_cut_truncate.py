@@ -4,10 +4,11 @@ from math import isclose
 import pytest
 
 from lhotse import RecordingSet
-from lhotse.cut import CutSet, MixedCut, MixTrack, MonoCut
+from lhotse.cut import CutSet, MixedCut, MixTrack, MonoCut, PaddingCut
 from lhotse.features import Features
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.testing.dummies import DummyManifest, dummy_cut, dummy_recording
+from lhotse.testing.random import deterministic_rng
 
 
 @pytest.fixture
@@ -139,6 +140,17 @@ def simple_mixed_cut():
     )
 
 
+@pytest.fixture
+def gapped_mixed_cut():
+    return MixedCut(
+        id="gapped-mixed-cut",
+        tracks=[
+            MixTrack(cut=dummy_cut(0, duration=10.0)),
+            MixTrack(cut=dummy_cut(1, duration=10.0), offset=15.0),
+        ],
+    )
+
+
 def test_truncate_mixed_cut_without_args(simple_mixed_cut):
     truncated_cut = simple_mixed_cut.truncate()
     assert truncated_cut.duration == 15.0
@@ -214,6 +226,14 @@ def test_truncate_mixed_cut_with_small_offset_and_duration(simple_mixed_cut):
     assert truncated_cut.duration == 13.0
 
 
+def test_truncate_mixed_cut_inside_gap(gapped_mixed_cut):
+    truncated_cut = gapped_mixed_cut.truncate(offset=11.0, duration=3.0)
+    assert isinstance(truncated_cut, PaddingCut)
+    assert truncated_cut.start == 0.0
+    assert truncated_cut.duration == 3.0
+    assert truncated_cut.end == 3.0
+
+
 def test_truncate_cut_set_offset_start(cut_set):
     truncated_cut_set = cut_set.truncate(max_duration=5, offset_type="start")
     cut1, cut2 = truncated_cut_set
@@ -236,7 +256,7 @@ def test_truncate_cut_set_offset_end(cut_set):
     assert isclose(cut2.duration, 5.0)
 
 
-def test_truncate_cut_set_offset_random(cut_set):
+def test_truncate_cut_set_offset_random(deterministic_rng, cut_set):
     truncated_cut_set = cut_set.truncate(max_duration=5, offset_type="random")
     cut1, cut2 = truncated_cut_set
     assert 0.0 <= cut1.start <= 5.0
@@ -251,7 +271,7 @@ def test_truncate_cut_set_offset_random(cut_set):
 
 
 @pytest.mark.parametrize("use_rng", [False, True])
-def test_truncate_cut_set_offset_random_rng(use_rng):
+def test_truncate_cut_set_offset_random_rng(deterministic_rng, use_rng):
     cuts1 = DummyManifest(CutSet, begin_id=0, end_id=30)
     cuts2 = DummyManifest(CutSet, begin_id=0, end_id=30)
 

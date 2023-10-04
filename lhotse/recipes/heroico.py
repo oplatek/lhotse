@@ -5,10 +5,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, Optional, Union
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import AudioSource, Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 # files containing transcripts
 heroico_dataset_answers = "heroico-answers.txt"
@@ -30,13 +30,12 @@ def download_heroico(
     completed_detector = target_dir / ".completed"
     if completed_detector.is_file():
         logging.info(f"Skipping {tar_name} because {completed_detector} exists.")
-        return
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(
-            f"{url}/{tar_name}", filename=tar_path, desc="Downloading Heroico"
-        )
+        return target_dir
+    resumable_download(
+        f"{url}/{tar_name}", filename=tar_path, force_download=force_download
+    )
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=target_dir)
+        safe_extract(tar, path=target_dir)
     completed_detector.touch()
 
     return target_dir
@@ -278,6 +277,7 @@ def prepare_heroico(
             for idx in audio.recordings
         )
 
+        audio, supervision = fix_manifests(audio, supervision)
         validate_recordings_and_supervisions(audio, supervision)
 
         if output_dir is not None:

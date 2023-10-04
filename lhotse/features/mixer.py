@@ -3,7 +3,7 @@ from typing import Optional
 import numpy as np
 
 from lhotse.features.base import FeatureExtractor
-from lhotse.utils import Decibels, NonPositiveEnergyError, Seconds, compute_num_frames
+from lhotse.utils import Decibels, Seconds, compute_num_frames
 
 
 class FeatureMixer:
@@ -46,6 +46,7 @@ class FeatureMixer:
         """
         self.feature_extractor = feature_extractor
         self.tracks = [base_feats]
+        self.num_channels = 1 if base_feats.ndim == 2 else base_feats.shape[-1]
         self.gains = []
         self.frame_shift = frame_shift
         self.padding_value = padding_value
@@ -57,9 +58,6 @@ class FeatureMixer:
             self.reference_energy = feature_extractor.compute_energy(base_feats)
         else:
             self.reference_energy = reference_energy
-        assert (
-            self.reference_energy > 0.0
-        ), f"To perform mix, energy must be non-zero and non-negative (got {self.reference_energy})"
 
     @property
     def num_features(self):
@@ -86,6 +84,19 @@ class FeatureMixer:
             )
         return result
 
+    def _get_dummy_array(self, num_frames: int) -> np.ndarray:
+        return np.full(
+            shape=(num_frames, self.num_features)
+            if self.num_channels == 1
+            else (
+                num_frames,
+                self.num_features,
+                self.num_channels,
+            ),
+            fill_value=self.padding_value,
+            dtype=self.dtype,
+        )
+
     def add_to_mix(
         self,
         feats: np.ndarray,
@@ -107,6 +118,10 @@ class FeatureMixer:
 
         assert offset >= 0.0, "Negative offset in mixing is not supported."
 
+        assert (
+            self.tracks[0].ndim == feats.ndim
+        ), f"Feature dimensions mismatch in mixing"
+
         reference_feats = self.tracks[0]
         num_frames_offset = compute_num_frames(
             duration=offset, frame_shift=self.frame_shift, sampling_rate=sampling_rate
@@ -124,11 +139,7 @@ class FeatureMixer:
                 padded_track = np.vstack(
                     [
                         self.tracks[idx],
-                        self.padding_value
-                        * np.ones(
-                            (mix_num_frames - current_num_frames, self.num_features),
-                            dtype=self.dtype,
-                        ),
+                        self._get_dummy_array(mix_num_frames - current_num_frames),
                     ]
                 )
                 self.tracks[idx] = padded_track
@@ -137,8 +148,7 @@ class FeatureMixer:
         if offset > 0:
             feats_to_add = np.vstack(
                 [
-                    self.padding_value
-                    * np.ones((num_frames_offset, self.num_features), dtype=self.dtype),
+                    self._get_dummy_array(num_frames_offset),
                     feats_to_add,
                 ]
             )
@@ -151,25 +161,17 @@ class FeatureMixer:
             feats_to_add = np.vstack(
                 [
                     feats_to_add,
-                    self.padding_value
-                    * np.ones(
-                        (mix_num_frames - incoming_num_frames, self.num_features),
-                        dtype=self.dtype,
-                    ),
+                    self._get_dummy_array(mix_num_frames - incoming_num_frames),
                 ]
             )
 
         # When SNR is requested, find what gain is needed to satisfy the SNR
         gain = 1.0
-        if snr is not None:
+        if snr is not None and self.reference_energy > 0.0:
             # Compute the added signal energy before it was padded
             added_feats_energy = self.feature_extractor.compute_energy(feats)
-            if added_feats_energy <= 0.0:
-                raise NonPositiveEnergyError(
-                    f"To perform mix, energy must be non-zero and non-negative (got {added_feats_energy}). "
-                )
-            target_energy = self.reference_energy * (10.0 ** (-snr / 10))
-            gain = target_energy / added_feats_energy
-
+            if added_feats_energy > 0.0:
+                target_energy = self.reference_energy * (10.0 ** (-snr / 10))
+                gain = target_energy / added_feats_energy
         self.tracks.append(feats_to_add)
         self.gains.append(gain)

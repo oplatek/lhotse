@@ -31,6 +31,36 @@ def test_combine_lazy(manifest_type):
 @pytest.mark.parametrize(
     "manifest_type", [RecordingSet, SupervisionSet, FeatureSet, CutSet]
 )
+def test_subset_first_lazy(manifest_type):
+    any_set = DummyManifest(manifest_type, begin_id=0, end_id=200)
+    expected = DummyManifest(manifest_type, begin_id=0, end_id=10)
+    subset = any_set.subset(first=10)
+    assert subset == expected
+
+
+@pytest.mark.parametrize(
+    "manifest_type", [RecordingSet, SupervisionSet, FeatureSet, CutSet]
+)
+def test_subset_last_lazy(manifest_type):
+    any_set = DummyManifest(manifest_type, begin_id=0, end_id=200)
+    expected = DummyManifest(manifest_type, begin_id=190, end_id=200)
+    subset = any_set.subset(last=10)
+    assert subset == expected
+
+
+@pytest.mark.parametrize(
+    "manifest_type", [RecordingSet, SupervisionSet, FeatureSet, CutSet]
+)
+@pytest.mark.parametrize(["first", "last"], [(None, None), (10, 10)])
+def test_subset_raises_lazy(manifest_type, first, last):
+    any_set = DummyManifest(manifest_type, begin_id=0, end_id=200)
+    with pytest.raises(AssertionError):
+        subset = any_set.subset(first=first, last=last)
+
+
+@pytest.mark.parametrize(
+    "manifest_type", [RecordingSet, SupervisionSet, FeatureSet, CutSet]
+)
 def test_map(manifest_type):
 
     expected = DummyManifest(manifest_type, begin_id=0, end_id=10)
@@ -71,7 +101,9 @@ def test_filter(manifest_type):
 
     with as_lazy(data) as lazy_data:
         lazy_result = lazy_data.filter(predicate)
-        assert list(lazy_result) == list(expected)
+        with pytest.raises(NotImplementedError):
+            assert list(lazy_result) == list(expected)
+        assert list(lazy_result.to_eager()) == list(expected)
 
 
 @pytest.mark.parametrize(
@@ -213,6 +245,6 @@ def test_dillable():
             ids = list(ex.map(_get_ids, [lazy_cuts]))
 
         assert ids[0] == [
-            "dummy-cut-0000-random-suffix",
-            "dummy-cut-0001-random-suffix",
+            "dummy-mono-cut-0000-random-suffix",
+            "dummy-mono-cut-0001-random-suffix",
         ]

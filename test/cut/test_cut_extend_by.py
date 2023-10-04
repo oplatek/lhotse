@@ -7,6 +7,7 @@ from lhotse.cut import MixedCut, PaddingCut
 from lhotse.testing.dummies import (
     dummy_cut,
     dummy_features,
+    dummy_multi_cut,
     dummy_recording,
     dummy_temporal_array,
 )
@@ -15,31 +16,57 @@ from lhotse.utils import LOG_EPSILON, uuid4
 
 @pytest.mark.parametrize(
     [
+        "cut_type",
         "cut_start",
         "cut_duration",
         "extend_duration",
         "extend_direction",
+        "pad_silence",
         "expected_start",
         "expected_end",
     ],
     [
-        (0.0, 0.5, 0.3, "right", 0.0, 0.8),
-        (0.0, 0.5, 0.3, "both", 0.0, 0.8),
-        (0.2, 0.5, 0.3, "left", 0.0, 0.7),
-        (0.2, 0.5, 0.1, "both", 0.1, 0.8),
-        (0.0, 0.8, 0.3, "both", 0.0, 1.0),
+        ("mono", 0.0, 0.5, 0.3, "right", False, 0.0, 0.8),
+        ("mono", 0.0, 0.5, 0.3, "both", False, 0.0, 0.8),
+        ("mono", 0.2, 0.5, 0.3, "left", False, 0.0, 0.7),
+        ("mono", 0.2, 0.5, 0.1, "both", False, 0.1, 0.8),
+        ("mono", 0.0, 0.8, 0.3, "both", False, 0.0, 1.0),
+        ("mono", 0.0, 0.5, 0.3, "right", True, 0.0, 0.8),
+        ("mono", 0.0, 0.5, 0.3, "both", True, 0.0, 1.1),
+        ("mono", 0.2, 0.5, 0.3, "left", True, 0.0, 0.8),
+        ("mono", 0.2, 0.5, 0.1, "both", True, 0.1, 0.8),
+        ("mono", 0.0, 0.8, 0.3, "both", True, 0.0, 1.4),
+        ("multi", 0.0, 0.5, 0.3, "right", False, 0.0, 0.8),
+        ("multi", 0.0, 0.5, 0.3, "both", False, 0.0, 0.8),
+        ("multi", 0.2, 0.5, 0.3, "left", False, 0.0, 0.7),
+        ("multi", 0.2, 0.5, 0.1, "both", False, 0.1, 0.8),
+        ("multi", 0.0, 0.8, 0.3, "both", False, 0.0, 1.0),
+        ("multi", 0.0, 0.5, 0.3, "right", True, 0.0, 0.8),
+        ("multi", 0.0, 0.5, 0.3, "both", True, 0.0, 1.1),
+        ("multi", 0.2, 0.5, 0.3, "left", True, 0.0, 0.8),
+        ("multi", 0.2, 0.5, 0.1, "both", True, 0.1, 0.8),
+        ("multi", 0.0, 0.8, 0.3, "both", True, 0.0, 1.4),
     ],
 )
 def test_extend_by_cut(
+    cut_type,
     cut_start,
     cut_duration,
     extend_duration,
     extend_direction,
+    pad_silence,
     expected_start,
     expected_end,
 ):
-    cut = dummy_cut(int(uuid4()), start=cut_start, duration=cut_duration)
-    extended_cut = cut.extend_by(duration=extend_duration, direction=extend_direction)
+    if cut_type == "mono":
+        cut = dummy_cut(int(uuid4()), start=cut_start, duration=cut_duration)
+    elif cut_type == "multi":
+        cut = dummy_multi_cut(int(uuid4()), start=cut_start, duration=cut_duration)
+    else:
+        raise ValueError(f"Invalid cut_type: {cut_type}")
+    extended_cut = cut.extend_by(
+        duration=extend_duration, direction=extend_direction, pad_silence=pad_silence
+    )
     assert isclose(extended_cut.start, expected_start)
     assert isclose(extended_cut.end, expected_end)
 
@@ -48,7 +75,7 @@ def test_extend_by_cut(
 def test_extend_by_cut_preserve_id(preserve_id):
     cut = dummy_cut(int(uuid4()), start=0.0, duration=0.5)
     extended_cut = cut.extend_by(
-        duration=0.3, direction="right", preserve_id=preserve_id
+        duration=0.3, direction="right", preserve_id=preserve_id, pad_silence=False
     )
     if preserve_id:
         assert extended_cut.id == cut.id
@@ -62,14 +89,17 @@ def test_extend_by_cut_preserve_id(preserve_id):
         "cut_duration",
         "extend_duration",
         "extend_direction",
+        "pad_silence",
         "supervision_start",
         "supervision_duration",
         "expected_start",
         "expected_end",
     ],
     [
-        (0.2, 0.5, 0.2, "right", 0.1, 0.7, 0.1, 0.8),
-        (0.2, 0.5, 0.1, "both", 0.2, 0.8, 0.3, 1.1),
+        (0.2, 0.5, 0.2, "right", False, 0.1, 0.7, 0.1, 0.8),
+        (0.2, 0.5, 0.1, "both", False, 0.2, 0.8, 0.3, 1.1),
+        (0.2, 0.5, 0.2, "right", True, 0.1, 0.7, 0.1, 0.8),
+        (0.2, 0.5, 0.1, "both", True, 0.2, 0.8, 0.3, 1.1),
     ],
 )
 def test_extend_by_cut_with_supervision(
@@ -77,6 +107,7 @@ def test_extend_by_cut_with_supervision(
     cut_duration,
     extend_duration,
     extend_direction,
+    pad_silence,
     supervision_start,
     supervision_duration,
     expected_start,
@@ -96,7 +127,9 @@ def test_extend_by_cut_with_supervision(
     cut = dummy_cut(
         int(uuid4()), start=cut_start, duration=cut_duration, supervisions=supervisions
     )
-    extended_cut = cut.extend_by(duration=extend_duration, direction=extend_direction)
+    extended_cut = cut.extend_by(
+        duration=extend_duration, direction=extend_direction, pad_silence=pad_silence
+    )
     assert isclose(extended_cut.supervisions[0].start, expected_start)
     assert isclose(extended_cut.supervisions[0].end, expected_end)
 
@@ -171,7 +204,9 @@ def test_extend_by_cut_with_features(
             int(uuid4()), start=feature_start, duration=feature_duration
         ),
     )
-    extended_cut = cut.extend_by(duration=extend_duration, direction=extend_direction)
+    extended_cut = cut.extend_by(
+        duration=extend_duration, direction=extend_direction, pad_silence=False
+    )
     if expected:
         assert extended_cut.features == cut.features
     else:
@@ -186,9 +221,9 @@ def test_cut_set_extend_by():
         duration=0.3, direction="both", preserve_id=True
     )
     assert isclose(extended_cut_set[cut1.id].start, 0.0)
-    assert isclose(extended_cut_set[cut1.id].end, 0.8)
+    assert isclose(extended_cut_set[cut1.id].end, 1.1)
     assert isclose(extended_cut_set[cut2.id].start, 0.0)
-    assert isclose(extended_cut_set[cut2.id].end, 0.9)
+    assert isclose(extended_cut_set[cut2.id].end, 1.0)
 
 
 # `cut1` and `cut2` parameters are standard Pytest fixtures located in test/cut/conftest.py

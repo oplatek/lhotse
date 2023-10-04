@@ -16,16 +16,16 @@ from typing import Dict, Optional, Union
 
 from tqdm.auto import tqdm
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 
 def text_normalize(line: str):
-    """
+    r"""
     Modified from https://github.com/wenet-e2e/wenet/blob/main/examples/multi_cn/s0/local/magicdata_data_prep.sh#L41
-     sed 's/！//g' | sed 's/？//g' |\
+    sed 's/！//g' | sed 's/？//g' |\
     sed 's/，//g' | sed 's/－//g' |\
     sed 's/：//g' | sed 's/；//g' |\
     sed 's/　//g' | sed 's/。//g' |\
@@ -67,6 +67,7 @@ def text_normalize(line: str):
     line = line.replace("》", "")
     line = line.replace("FIL", "")
     line = line.replace("SPK", "")
+    line = line.replace("﻿", "")
     line = line.upper()
     return line
 
@@ -99,13 +100,12 @@ def download_magicdata(
                 f"Skipping download {tar_name} because {completed_detector} exists."
             )
             continue
-        if force_download or not tar_path.is_file():
-            urlretrieve_progress(
-                f"{url}/{tar_name}", filename=tar_path, desc=f"Downloading {tar_name}"
-            )
+        resumable_download(
+            f"{url}/{tar_name}", filename=tar_path, force_download=force_download
+        )
         shutil.rmtree(extracted_dir, ignore_errors=True)
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=corpus_dir)
+            safe_extract(tar, path=corpus_dir)
         completed_detector.touch()
 
     return corpus_dir
@@ -185,6 +185,8 @@ def prepare_magicdata(
 
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
+
+        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
         validate_recordings_and_supervisions(recording_set, supervision_set)
 
         if output_dir is not None:

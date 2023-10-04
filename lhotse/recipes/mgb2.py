@@ -168,7 +168,8 @@ def prepare_mgb2(
 
             if text_cleaning is True:
                 supervisions = supervisions.transform_text(cleaning)
-            recordings, supervisions = fix_manifests(recordings, supervisions)
+
+        recordings, supervisions = fix_manifests(recordings, supervisions)
         validate_recordings_and_supervisions(recordings, supervisions)
 
         # saving recordings and supervisions
@@ -259,8 +260,8 @@ def east_to_west_num(text: str) -> str:
 
 
 def remove_extra_space(text: str) -> str:
-    text = sub("\s+", " ", text)
-    text = sub("\s+\.\s+", ".", text)
+    text = sub(r"\s+", " ", text)
+    text = sub(r"\s+\.\s+", ".", text)
     return text
 
 

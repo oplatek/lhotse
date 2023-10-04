@@ -50,8 +50,8 @@ from lhotse import (
     SupervisionSet,
 )
 from lhotse.manipulation import combine
-from lhotse.qa import validate_recordings_and_supervisions
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.qa import fix_manifests, validate_recordings_and_supervisions
+from lhotse.utils import Pathlike, resumable_download
 
 VOXCELEB1_PARTS_URL = [
     "https://thor.robots.ox.ac.uk/~vgg/data/voxceleb/vox1a/vox1_dev_wav_partaa",
@@ -118,10 +118,8 @@ def _download_voxceleb(
                 ).name
                 temp_dir = Path(temp_dir)
                 temp_target_file = temp_dir / url_filename
-                urlretrieve_progress(
-                    url,
-                    filename=temp_target_file,
-                    desc=f"Downloading {voxceleb_name} {url_filename}",
+                resumable_download(
+                    url, filename=temp_target_file, force_download=force_download
                 )
             # Combine the parts for dev set
             with open(temp_dir / dev_zip_name, "wb") as outFile:
@@ -266,7 +264,14 @@ def prepare_voxceleb(
             continue
         recordings = manifests[split]["recordings"]
         supervisions = manifests[split]["supervisions"]
+
+        # Fix manifests and validate
+        recordings, supervisions = fix_manifests(recordings, supervisions)
         validate_recordings_and_supervisions(recordings, supervisions)
+
+        # Write the manifests to the output directory
+        manifests[split]["recordings"] = recordings
+        manifests[split]["supervisions"] = supervisions
         if output_dir is not None:
             recordings.to_file(output_dir / f"voxceleb_recordings_{split}.jsonl.gz")
             supervisions.to_file(output_dir / f"voxceleb_supervisions_{split}.jsonl.gz")
@@ -339,7 +344,7 @@ def _prepare_voxceleb_trials(
     recordings = manifests["recordings"]
     supervisions = manifests["supervisions"]
     cuts_utt1_pos, cuts_utt2_pos, cuts_utt1_neg, cuts_utt2_neg = [], [], [], []
-    urlretrieve_progress(VOXCELEB1_TRIALS_URL, filename="voxceleb_trials.txt")
+    resumable_download(VOXCELEB1_TRIALS_URL, filename="voxceleb_trials.txt")
     with open("voxceleb_trials.txt", "r") as f:
         for idx, line in enumerate(f):
             target, utt1, utt2 = line.strip().split(" ")

@@ -2,7 +2,8 @@ import itertools
 import json
 import sys
 import warnings
-from contextlib import contextmanager
+from codecs import StreamReader, StreamWriter
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterable, Optional, Type, Union
 
@@ -20,9 +21,14 @@ def open_best(path: Pathlike, mode: str = "r"):
     """
     Auto-determine the best way to open the input path or URI.
     Uses ``smart_open`` when available to handle URLs and URIs.
+
     Supports providing "-" as input to read from stdin or save to stdout.
+
+    If the input is prefixed with "pipe:", it will open a subprocess and redirect
+    either stdin or stdout depending on the mode.
+    The concept is similar to Kaldi's "generalized pipes", but uses WebDataset syntax.
     """
-    if path == "-":
+    if str(path) == "-":
         if mode == "r":
             return StdStreamWrapper(sys.stdin)
         elif mode == "w":
@@ -31,6 +37,12 @@ def open_best(path: Pathlike, mode: str = "r"):
             raise ValueError(
                 f"Cannot open stream for '-' with mode other 'r' or 'w' (got: '{mode}')"
             )
+
+    if isinstance(path, (BytesIO, StringIO, StreamWriter, StreamReader)):
+        return path
+
+    if str(path).startswith("pipe:"):
+        return open_pipe(path[5:], mode)
 
     if is_module_available("smart_open"):
         from smart_open import smart_open
@@ -47,6 +59,16 @@ def open_best(path: Pathlike, mode: str = "r"):
     return open_fn(path, mode)
 
 
+def open_pipe(cmd: str, mode: str):
+    """
+    Runs the command and redirects stdin/stdout depending on the mode.
+    Returns a file-like object that can be read from or written to.
+    """
+    from lhotse.utils import Pipe
+
+    return Pipe(cmd, mode=mode, shell=True, bufsize=8092)
+
+
 def save_to_yaml(data: Any, path: Pathlike) -> None:
     with open_best(path, "w") as f:
         try:
@@ -57,7 +79,7 @@ def save_to_yaml(data: Any, path: Pathlike) -> None:
 
 
 def load_yaml(path: Pathlike) -> dict:
-    with open_best(path) as f:
+    with open_best(path, "r") as f:
         try:
             # When pyyaml is installed with C extensions, it can speed up the (de)serialization noticeably
             return yaml.load(stream=f, Loader=yaml.CSafeLoader)
@@ -83,7 +105,7 @@ def save_to_json(data: Any, path: Pathlike) -> None:
 
 def load_json(path: Pathlike) -> Union[dict, list]:
     """Load a JSON file. Also supports compressed JSON with a ``.gz`` extension."""
-    with open_best(path) as f:
+    with open_best(path, "r") as f:
         return json.load(f)
 
 
@@ -106,7 +128,7 @@ def save_to_jsonl(data: Iterable[Dict[str, Any]], path: Pathlike) -> None:
 
 def load_jsonl(path: Pathlike) -> Generator[Dict[str, Any], None, None]:
     """Load a JSON file. Also supports compressed JSON with a ``.gz`` extension."""
-    with open_best(path) as f:
+    with open_best(path, "r") as f:
         for line in f:
             # The temporary variable helps fail fast
             ret = decode_json_line(line)
@@ -150,7 +172,8 @@ class SequentialJsonlWriter:
 
     def __init__(self, path: Pathlike, overwrite: bool = True) -> None:
         self.path = path
-        if not extension_contains(".jsonl", self.path):
+        self.file = None
+        if not (extension_contains(".jsonl", self.path) or (self.path == "-")):
             raise InvalidPathExtension(
                 f"SequentialJsonlWriter supports only JSONL format (one JSON item per line), "
                 f"but path='{path}'."
@@ -159,7 +182,7 @@ class SequentialJsonlWriter:
         self.ignore_ids = set()
         if Path(self.path).is_file() and not overwrite:
             self.mode = "a"
-            with open_best(self.path) as f:
+            with open_best(self.path, "r") as f:
                 self.ignore_ids = {
                     data["id"]
                     for data in (decode_json_line(line) for line in f)
@@ -167,11 +190,11 @@ class SequentialJsonlWriter:
                 }
 
     def __enter__(self) -> "SequentialJsonlWriter":
-        self.file = open_best(self.path, self.mode)
+        self._maybe_open()
         return self
 
     def __exit__(self, *args, **kwargs) -> None:
-        self.file.close()
+        self.close()
 
     def __contains__(self, item: Union[str, Any]) -> bool:
         if isinstance(item, str):
@@ -182,6 +205,15 @@ class SequentialJsonlWriter:
             # The only case when this happens is for the FeatureSet -- Features do not have IDs.
             # In that case we can't know if they are already written or not.
             return False
+
+    def _maybe_open(self):
+        if self.file is None:
+            self.file = open_best(self.path, self.mode)
+
+    def close(self):
+        if self.file is not None:
+            self.file.close()
+            self.file = None
 
     def contains(self, item: Union[str, Any]) -> bool:
         return item in self
@@ -200,7 +232,10 @@ class SequentialJsonlWriter:
                 return
         except AttributeError:
             pass
-        print(json.dumps(manifest.to_dict(), ensure_ascii=False), file=self.file)
+        self._maybe_open()
+        if not isinstance(manifest, dict):
+            manifest = manifest.to_dict()
+        print(json.dumps(manifest, ensure_ascii=False), file=self.file)
         if flush:
             self.file.flush()
 
@@ -212,7 +247,7 @@ class SequentialJsonlWriter:
         """
         if not Path(self.path).exists():
             return None
-        if not self.file.closed:
+        if self.file is not None and not self.file.closed:
             # If the user hasn't finished writing, make sure the latest
             # changes are propagated.
             self.file.flush()
@@ -360,9 +395,9 @@ class LazyMixin:
         .. warning:: Opening the manifest in this way might cause some methods that
             rely on random access to fail.
         """
-        from lhotse.lazy import LazyJsonlIterator
+        from lhotse.lazy import LazyManifestIterator
 
-        return cls(LazyJsonlIterator(path))
+        return cls(LazyManifestIterator(path))
 
 
 def grouper(n, iterable):
@@ -424,7 +459,7 @@ def load_manifest_lazy(path: Pathlike) -> Optional[Manifest]:
     Generic utility for reading an arbitrary manifest from a JSONL file.
     Returns None when the manifest is empty.
     """
-    assert extension_contains(".jsonl", path) or path == "-"
+    assert extension_contains(".jsonl", path) or str(path) == "-"
     raw_data = iter(load_jsonl(path))
     try:
         first = next(raw_data)
@@ -442,7 +477,7 @@ def load_manifest_lazy_or_eager(
     Generic utility for reading an arbitrary manifest.
     If possible, opens the manifest lazily, otherwise reads everything into memory.
     """
-    if extension_contains(".jsonl", path) or path == "-":
+    if extension_contains(".jsonl", path) or str(path) == "-":
         return load_manifest_lazy(path)
     else:
         return load_manifest(path, manifest_cls=manifest_cls)
@@ -468,13 +503,17 @@ def resolve_manifest_set_class(item):
         return CutSet
     if isinstance(item, Features):
         return FeatureSet
-    raise ValueError(
+    raise NotALhotseManifest(
         f"No corresponding 'Set' class is known for item of type: {type(item)}"
     )
 
 
+class NotALhotseManifest(Exception):
+    pass
+
+
 def store_manifest(manifest: Manifest, path: Pathlike) -> None:
-    if extension_contains(".jsonl", path) or path == "-":
+    if extension_contains(".jsonl", path) or str(path) == "-":
         manifest.to_jsonl(path)
     elif extension_contains(".json", path):
         manifest.to_json(path)
@@ -496,7 +535,7 @@ class Serializable(JsonMixin, JsonlMixin, LazyMixin, YamlMixin):
 def deserialize_item(data: dict) -> Any:
     # Figures out what type of manifest is being decoded with some heuristics
     # and returns a Lhotse manifest object rather than a raw dict.
-    from lhotse import Features, MonoCut, Recording, SupervisionSegment
+    from lhotse import Features, MonoCut, MultiCut, Recording, SupervisionSegment
     from lhotse.array import deserialize_array
     from lhotse.cut import MixedCut
 
@@ -511,6 +550,8 @@ def deserialize_item(data: dict) -> Any:
     cut_type = data.pop("type")
     if cut_type == "MonoCut":
         return MonoCut.from_dict(data)
+    if cut_type == "MultiCut":
+        return MultiCut.from_dict(data)
     if cut_type == "Cut":
         warnings.warn(
             "Your manifest was created with Lhotse version earlier than v0.8, when MonoCut was called Cut. "

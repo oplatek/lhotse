@@ -11,6 +11,7 @@ from lhotse import (
     SupervisionSet,
     validate_recordings_and_supervisions,
 )
+from lhotse.qa import fix_manifests
 from lhotse.utils import Pathlike, urlretrieve_progress
 
 

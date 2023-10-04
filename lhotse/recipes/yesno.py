@@ -30,10 +30,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 _DEFAULT_URL = "http://www.openslr.org/resources/1/waves_yesno.tar.gz"
 
@@ -62,15 +62,12 @@ def download_yesno(
         logging.info(f"Skipping - {completed_detector} exists.")
         return extracted_dir
 
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(
-            f"{url}", filename=tar_path, desc=f"Downloading waves_yesno.tar.gz"
-        )
+    resumable_download(url, filename=tar_path, force_download=force_download)
 
     shutil.rmtree(extracted_dir, ignore_errors=True)
 
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=target_dir)
+        safe_extract(tar, path=target_dir)
 
     completed_detector.touch()
 
@@ -99,7 +96,7 @@ def _prepare_dataset(
         words = [word_map[w] for w in words]
         text = " ".join(words)
 
-        recording = Recording.from_file(audio_path)
+        recording = Recording.from_file(audio_path.absolute())
         recordings.append(recording)
 
         segment = SupervisionSegment(
@@ -155,6 +152,7 @@ def prepare_yesno(
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
 
+        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
         validate_recordings_and_supervisions(recording_set, supervision_set)
 
         if output_dir is not None:

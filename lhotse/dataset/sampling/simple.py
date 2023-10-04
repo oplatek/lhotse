@@ -30,8 +30,6 @@ class SimpleCutSampler(CutSampler):
     def __init__(
         self,
         cuts: CutSet,
-        max_frames: int = None,
-        max_samples: int = None,
         max_duration: Seconds = None,
         max_cuts: Optional[int] = None,
         shuffle: bool = False,
@@ -39,14 +37,11 @@ class SimpleCutSampler(CutSampler):
         world_size: Optional[int] = None,
         rank: Optional[int] = None,
         seed: int = 0,
-        strict=None,
     ):
         """
         SimpleCutSampler's constructor.
 
         :param cuts: the ``CutSet`` to sample data from.
-        :param max_frames: The maximum total number of feature frames from ``cuts``.
-        :param max_samples: The maximum total number of audio samples from ``cuts``.
         :param max_duration: The maximum total recording duration from ``cuts``.
         :param max_cuts: The maximum number of cuts sampled to form a mini-batch.
             By default, this constraint is off.
@@ -66,19 +61,14 @@ class SimpleCutSampler(CutSampler):
             rank=rank,
             seed=seed,
         )
+        assert any(
+            v is not None for v in (max_duration, max_cuts)
+        ), "At least one of max_duration or max_cuts has to be set."
         self.data_source = DataSource(cuts)
         self.time_constraint = TimeConstraint(
             max_duration=max_duration,
-            max_frames=max_frames,
-            max_samples=max_samples,
             max_cuts=max_cuts,
         )
-        if strict is not None:
-            warnings.warn(
-                "In Lhotse v1.4 all samplers act as if 'strict=True'. "
-                "Sampler's argument 'strict' will be removed in a future Lhotse release.",
-                category=DeprecationWarning,
-            )
 
     @property
     def remaining_duration(self) -> Optional[float]:
@@ -162,6 +152,11 @@ class SimpleCutSampler(CutSampler):
         # Restored state with load_state_dict()? Skip resetting only this once.
         if self._just_restored_state:
             return self
+        # Why reset the current epoch?
+        # Either we are iterating the epoch for the first time and it's a no-op,
+        # or we are iterating the same epoch again, in which case setting more steps
+        # than are actually available per epoch would have broken the checkpoint restoration.
+        self.diagnostics.reset_current_epoch()
         # Reset the state to the beginning of the epoch.
         if self.shuffle:
             self.data_source.shuffle(self.seed + self.epoch)
@@ -227,14 +222,3 @@ class SimpleCutSampler(CutSampler):
                     cuts.append(next_cut)
 
         return CutSet.from_cuts(cuts)
-
-
-class SingleCutSampler(SimpleCutSampler):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        warnings.warn(
-            "SingleCutSampler was renamed to SimpleCutSampler in Lhotse v1.0 to avoid confusion "
-            "(the previous name suggested it sampled a single cut rather than a batch of cuts). "
-            "The alias 'SingleCutSampler' is deprecated and will be removed in Lhotse v1.1",
-            category=DeprecationWarning,
-        )

@@ -1,7 +1,7 @@
 import pickle
-import threading
 from abc import ABCMeta, abstractmethod
 from functools import lru_cache
+from io import BytesIO
 from math import ceil, floor
 from pathlib import Path
 from typing import List, Optional, Type, Union
@@ -11,7 +11,7 @@ import numpy as np
 
 from lhotse.array import Array, TemporalArray
 from lhotse.caching import dynamic_lru_cache
-from lhotse.utils import Pathlike, Seconds, SmartOpen, is_module_available
+from lhotse.utils import Pathlike, Seconds, SmartOpen, is_module_available, pairwise
 
 
 class FeaturesWriter(metaclass=ABCMeta):
@@ -387,9 +387,13 @@ def lookup_chunk_size(h5_file_handle) -> int:
 
 
 def close_cached_file_handles() -> None:
-    """Closes the cached file handles in ``lookup_cache_or_open`` (see its docs for more details)."""
+    """
+    Closes the cached file handles in ``lookup_cache_or_open`` and
+    ``lookup_reader_cache_or_open`` (see respective docs for more details).
+    """
     lookup_cache_or_open.cache_clear()
     lookup_chunk_size.cache_clear()
+    lookup_reader_cache_or_open.cache_clear()
 
 
 @register_reader
@@ -943,6 +947,29 @@ Kaldi-compatible feature reader
 """
 
 
+def check_kaldi_native_io_installed():
+    if not is_module_available("kaldi_native_io"):
+        raise ValueError(
+            "To read Kaldi feats.scp, please 'pip install kaldi_native_io' first."
+        )
+
+
+@lru_cache(maxsize=None)
+def lookup_reader_cache_or_open(storage_path: str):
+    """
+    Helper internal function used in KaldiReader.
+    It opens kaldi scp files and keeps their handles open in a global program cache
+    to avoid excessive amount of syscalls when the Reader class is instantiated
+    and destroyed in a loop repeatedly (frequent use-case).
+
+    The file handles can be freed at any time by calling ``close_cached_file_handles()``.
+    """
+    check_kaldi_native_io_installed()
+    import kaldi_native_io
+
+    return kaldi_native_io.RandomAccessFloatMatrixReader(f"scp:{storage_path}")
+
+
 @register_reader
 class KaldiReader(FeaturesReader):
     """
@@ -957,17 +984,16 @@ class KaldiReader(FeaturesReader):
     name = "kaldiio"
 
     def __init__(self, storage_path: Pathlike, *args, **kwargs):
-        if not is_module_available("kaldi_native_io"):
-            raise ValueError(
-                "To read Kaldi feats.scp, please 'pip install kaldi_native_io' first."
-            )
-        import kaldi_native_io
-
         super().__init__()
         self.storage_path = storage_path
-        self.storage = kaldi_native_io.RandomAccessFloatMatrixReader(
-            f"scp:{self.storage_path}"
-        )
+        if storage_path.endswith(".scp"):
+            self.storage = lookup_reader_cache_or_open(self.storage_path)
+        else:
+            check_kaldi_native_io_installed()
+            import kaldi_native_io
+
+            self.storage = None
+            self.reader = kaldi_native_io.FloatMatrix
 
     @dynamic_lru_cache
     def read(
@@ -976,7 +1002,11 @@ class KaldiReader(FeaturesReader):
         left_offset_frames: int = 0,
         right_offset_frames: Optional[int] = None,
     ) -> np.ndarray:
-        arr = np.copy(self.storage[key])
+        if self.storage is not None:
+            arr = np.copy(self.storage[key])
+        else:
+            arr = self.reader.read(self.storage_path).numpy()
+
         return arr[left_offset_frames:right_offset_frames]
 
 
@@ -1091,8 +1121,13 @@ class MemoryLilcomWriter(FeaturesWriter):
 
     name = "memory_lilcom"
 
-    def __init__(self, *args, **kwargs):
-        pass
+    def __init__(
+        self,
+        *args,
+        lilcom_tick_power: int = -5,
+        **kwargs,
+    ) -> None:
+        self.lilcom_tick_power = lilcom_tick_power
 
     @property
     def storage_path(self) -> None:
@@ -1102,7 +1137,7 @@ class MemoryLilcomWriter(FeaturesWriter):
         assert np.issubdtype(
             value.dtype, np.floating
         ), "Lilcom compression supports only floating-point arrays."
-        return lilcom.compress(value)
+        return lilcom.compress(value, tick_power=self.lilcom_tick_power)
 
     def close(self) -> None:
         pass
@@ -1160,10 +1195,37 @@ class MemoryRawWriter(FeaturesWriter):
         pass
 
 
-def pairwise(iterable):
-    "s -> (s0,s1), (s1,s2), (s2, s3), ..."
-    from itertools import tee
+@register_reader
+class MemoryNpyReader(FeaturesReader):
+    """ """
 
-    a, b = tee(iterable)
-    next(b, None)
-    return zip(a, b)
+    name = "memory_npy"
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    @dynamic_lru_cache
+    def read(
+        self,
+        raw_data: bytes,
+        left_offset_frames: int = 0,
+        right_offset_frames: Optional[int] = None,
+    ) -> np.ndarray:
+        stream = BytesIO(raw_data)
+        arr = np.load(stream)
+        return arr[left_offset_frames:right_offset_frames]
+
+
+@register_reader
+class DummySharReader(FeaturesReader):
+    """ """
+
+    name = "shar"
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def read(self, *args, **kwargs) -> np.ndarray:
+        raise RuntimeError(
+            "Inconsistent state: found a Lhotse Shar placeholder array that was not filled during deserialization."
+        )

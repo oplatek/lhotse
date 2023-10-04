@@ -35,8 +35,8 @@ from lhotse import (
     SupervisionSet,
     validate_recordings_and_supervisions,
 )
-from lhotse.qa import remove_missing_recordings_and_supervisions
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.qa import fix_manifests
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 BASE_URL = "http://festvox.org/cmu_arctic/packed/"
 
@@ -112,13 +112,10 @@ def download_cmu_arctic(
         if completed_detector.is_file():
             logging.info(f"Skiping {spk} because {completed_detector} exists.")
             continue
-        if force_download or not tar_path.is_file():
-            urlretrieve_progress(
-                full_url, filename=tar_path, desc=f"Downloading {tar_name}"
-            )
+        resumable_download(full_url, filename=tar_path, force_download=force_download)
         shutil.rmtree(part_dir, ignore_errors=True)
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=target_dir)
+            safe_extract(tar, path=target_dir)
         completed_detector.touch()
 
     return target_dir
@@ -170,9 +167,7 @@ def prepare_cmu_arctic(
     supervisions = SupervisionSet.from_segments(supervisions)
 
     # There seem to be 20 recordings missing; remove the before validation
-    recordings, supervisions = remove_missing_recordings_and_supervisions(
-        recordings, supervisions
-    )
+    recordings, supervisions = fix_manifests(recordings, supervisions)
     validate_recordings_and_supervisions(recordings, supervisions)
 
     if output_dir is not None:

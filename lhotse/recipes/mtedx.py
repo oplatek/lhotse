@@ -39,11 +39,8 @@ from lhotse import (
     SupervisionSet,
     validate_recordings_and_supervisions,
 )
-from lhotse.qa import (
-    remove_missing_recordings_and_supervisions,
-    trim_supervisions_to_recordings,
-)
-from lhotse.utils import Pathlike, is_module_available, urlretrieve_progress
+from lhotse.qa import fix_manifests
+from lhotse.utils import Pathlike, is_module_available, resumable_download, safe_extract
 
 # Keep Markings such as vowel signs, all letters, and decimal numbers
 VALID_CATEGORIES = ("Mc", "Mn", "Ll", "Lm", "Lo", "Lt", "Lu", "Nd", "Zs")
@@ -107,13 +104,11 @@ def download_mtedx(
         if completed_detector.is_file():
             logging.info(f"Skipping {lang} because {completed_detector} exists.")
             continue
-        urlretrieve_progress(
-            f"http://www.openslr.org/resources/100/mtedx_{lang}.tgz",
-            filename=tar_path,
-            desc=f"Downloading MTEDx {lang}",
+        resumable_download(
+            f"http://www.openslr.org/resources/100/mtedx_{lang}.tgz", filename=tar_path
         )
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=target_dir)
+            safe_extract(tar, path=target_dir)
         completed_detector.touch()
 
     return target_dir
@@ -228,10 +223,7 @@ def prepare_single_mtedx_language(
                 logging.warning(f"No supervisions found in {text_dir}")
             supervisions = SupervisionSet.from_segments(supervisions)
 
-            recordings, supervisions = remove_missing_recordings_and_supervisions(
-                recordings, supervisions
-            )
-            supervisions = trim_supervisions_to_recordings(recordings, supervisions)
+            recordings, supervisions = fix_manifests(recordings, supervisions)
             validate_recordings_and_supervisions(recordings, supervisions)
 
             manifests[split] = {

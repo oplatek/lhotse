@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from lhotse import (
+    AudioSource,
     Fbank,
     FbankConfig,
     Features,
@@ -16,17 +17,29 @@ from lhotse import (
     SupervisionSet,
     load_manifest,
 )
-from lhotse.audio import AudioSource
-from lhotse.cut import CutSet, MixedCut, MixTrack, MonoCut
+from lhotse.cut import CutSet, MixedCut, MixTrack, MonoCut, MultiCut
+from lhotse.cut.describe import CutSetStatistics
 from lhotse.serialization import load_jsonl
 from lhotse.testing.dummies import (
     DummyManifest,
+    as_lazy,
     dummy_cut,
     dummy_recording,
     dummy_supervision,
     remove_spaces_from_segment_text,
 )
 from lhotse.utils import is_module_available
+
+
+@pytest.fixture
+def mini_librispeeh2_cut_set():
+    recordings = RecordingSet.from_file(
+        "test/fixtures/mini_librispeech2/lhotse/recordings.jsonl.gz"
+    )
+    supervisions = SupervisionSet.from_file(
+        "test/fixtures/mini_librispeech2/lhotse/supervisions.jsonl.gz"
+    )
+    return CutSet.from_manifests(recordings=recordings, supervisions=supervisions)
 
 
 @pytest.fixture
@@ -48,6 +61,18 @@ def cut_set_with_mixed_cut(cut1, cut2):
 def test_cut_set_sort_by_duration(cut_set_with_mixed_cut, ascending, expected):
     cs = cut_set_with_mixed_cut.sort_by_duration(ascending=ascending)
     assert [c.duration for c in cs] == expected
+
+
+@pytest.mark.parametrize(
+    ["ascending", "expected"],
+    [
+        (True, ["lbi-3536-23268-0000", "lbi-6241-61943-0000", "lbi-8842-304647-0000"]),
+        (False, ["lbi-8842-304647-0000", "lbi-6241-61943-0000", "lbi-3536-23268-0000"]),
+    ],
+)
+def test_cut_set_sort_by_recording_id(mini_librispeeh2_cut_set, ascending, expected):
+    cs = mini_librispeeh2_cut_set.sort_by_recording_id(ascending)
+    assert [c.recording.id for c in cs] == expected
 
 
 def test_cut_set_iteration(cut_set_with_mixed_cut):
@@ -350,11 +375,31 @@ def test_trim_to_supervisions_mixed_cuts_keep_overlapping_true(
     assert sup.duration == 18
 
 
-@pytest.mark.skipif(
-    not is_module_available("pandas"), reason="Requires pandas to be installed."
-)
-def test_cut_set_describe_runs(cut_set):
-    cut_set.describe()
+@pytest.mark.parametrize("full", [True, False])
+def test_cut_set_describe_runs(cut_set, full, capfd):
+    cut_set.describe(full=full)
+    out, err = capfd.readouterr()
+    assert out != ""
+    assert err == ""
+
+
+@pytest.mark.parametrize("full", [True, False])
+def test_cut_set_stats_combine(cut_set, full, capfd):
+
+    # Describe a "large" cut set containing two parts
+    cs = cut_set.repeat(2)
+    cs.describe(full=full)
+    out, err = capfd.readouterr()
+
+    # Describe a combination of stats from two parts of that cut set
+    stats1 = CutSetStatistics(full=full).accumulate(cut_set)
+    stats2 = CutSetStatistics(full=full).accumulate(cut_set)
+    stats = stats1.combine(stats2)
+    stats.describe()
+    out2, err2 = capfd.readouterr()
+
+    assert out == out2
+    assert err == err2
 
 
 def test_cut_map_supervisions(cut_set):
@@ -414,7 +459,7 @@ def test_mixed_cut_set_prefix(cut_with_relative_paths):
             assert t.cut.features.storage_path == "/data/storage_dir"
 
 
-def test_mix_same_recording_channels():
+def test_combine_same_recording_channels():
     recording = Recording(
         "rec",
         sampling_rate=8000,
@@ -432,14 +477,12 @@ def test_mix_same_recording_channels():
         ]
     )
 
-    mixed = cut_set.mix_same_recording_channels()
-    assert len(mixed) == 1
+    multi = cut_set.combine_same_recording_channels()
+    assert len(multi) == 1
 
-    cut = mixed[0]
-    assert isinstance(cut, MixedCut)
-    assert len(cut.tracks) == 2
-    assert cut.tracks[0].cut == cut_set[0]
-    assert cut.tracks[1].cut == cut_set[1]
+    cut = multi[0]
+    assert isinstance(cut, MultiCut)
+    assert cut.num_channels == 2
 
 
 def test_cut_set_filter_supervisions(cut_set):
@@ -491,6 +534,18 @@ def test_compute_cmvn_stats_on_the_fly(max_cuts):
         )
 
 
+@pytest.mark.parametrize("nj", [1, 2])
+def test_compute_and_store_features_lazy(nj):
+    eager_cuts = CutSet.from_json("test/fixtures/libri/cuts.json").repeat(10)
+    with as_lazy(eager_cuts) as cut_set:
+        fbank = Fbank()
+        with TemporaryDirectory() as d:
+            with_feats = cut_set.compute_and_store_features(fbank, d, num_jobs=nj)
+            assert len(with_feats) == len(cut_set)
+            assert set(with_feats.ids) == set(cut_set.ids)
+            assert all(c.has_features for c in with_feats)
+
+
 def test_modify_ids(cut_set_with_mixed_cut):
     cut_set = cut_set_with_mixed_cut.modify_ids(lambda cut_id: f"{cut_id}_suffix")
     for ref_cut, mod_cut in zip(cut_set_with_mixed_cut, cut_set):
@@ -509,38 +564,63 @@ def test_map_cut_set_rejects_noncut(cut_set_with_mixed_cut):
         cut_set = cut_set_with_mixed_cut.map(lambda cut: "not-a-cut")
 
 
-def test_store_audio():
-    cut_set = CutSet.from_json("test/fixtures/libri/cuts.json")
+@pytest.mark.parametrize("num_jobs", [1, 2])
+def test_store_audio(num_jobs):
+    cut_set = CutSet.from_json("test/fixtures/ljspeech/cuts.json")
+    cut_set = cut_set.sort_by_duration()
     with TemporaryDirectory() as tmpdir:
-        stored_cut_set = cut_set.save_audios(tmpdir)
-        for cut1, cut2 in zip(cut_set, stored_cut_set):
-            samples1 = cut1.load_audio()
-            samples2 = cut2.load_audio()
-            assert np.array_equal(samples1, samples2)
-        assert len(stored_cut_set) == len(cut_set)
+        for enc, bits in (
+            ("PCM_S", 16),
+            ("PCM_F", 32),
+            (None, 16),
+            ("PCM_S", None),
+            (None, None),
+        ):
+            stored_cut_set = cut_set.save_audios(
+                tmpdir, encoding=enc, bits_per_sample=bits, num_jobs=num_jobs
+            )
+
+            stored_cut_set = stored_cut_set.sort_by_duration()
+            for cut1, cut2 in zip(cut_set, stored_cut_set):
+                samples1 = cut1.load_audio()
+                samples2 = cut2.load_audio()
+                assert np.array_equal(samples1, samples2)
+            assert len(stored_cut_set) == len(cut_set)
+
+    with TemporaryDirectory() as tmpdir:
+        for bits in (16, 24, None):
+            stored_cut_set = cut_set.save_audios(
+                tmpdir, format="flac", bits_per_sample=bits, num_jobs=num_jobs
+            )
+            stored_cut_set = stored_cut_set.sort_by_duration()
+            for cut1, cut2 in zip(cut_set, stored_cut_set):
+                samples1 = cut1.load_audio()
+                samples2 = cut2.load_audio()
+                assert np.array_equal(samples1, samples2)
+            assert len(stored_cut_set) == len(cut_set)
 
 
 def test_cut_set_subset_cut_ids_preserves_order():
     cuts = DummyManifest(CutSet, begin_id=0, end_id=1000)
-    cut_ids = ["dummy-cut-0010", "dummy-cut-0171", "dummy-cut-0009"]
+    cut_ids = ["dummy-mono-cut-0010", "dummy-mono-cut-0171", "dummy-mono-cut-0009"]
     subcuts = cuts.subset(cut_ids=cut_ids)
     cut1, cut2, cut3 = subcuts
-    assert cut1.id == "dummy-cut-0010"
-    assert cut2.id == "dummy-cut-0171"
-    assert cut3.id == "dummy-cut-0009"
+    assert cut1.id == "dummy-mono-cut-0010"
+    assert cut2.id == "dummy-mono-cut-0171"
+    assert cut3.id == "dummy-mono-cut-0009"
 
 
 def test_cut_set_subset_cut_ids_preserves_order_with_lazy_manifest():
     cuts = DummyManifest(CutSet, begin_id=0, end_id=1000)
-    cut_ids = ["dummy-cut-0010", "dummy-cut-0171", "dummy-cut-0009"]
+    cut_ids = ["dummy-mono-cut-0010", "dummy-mono-cut-0171", "dummy-mono-cut-0009"]
     with NamedTemporaryFile(suffix=".jsonl.gz") as f:
         cuts.to_file(f.name)
         cuts = cuts.from_jsonl_lazy(f.name)
         subcuts = cuts.subset(cut_ids=cut_ids)
         cut1, cut2, cut3 = subcuts
-        assert cut1.id == "dummy-cut-0010"
-        assert cut2.id == "dummy-cut-0171"
-        assert cut3.id == "dummy-cut-0009"
+        assert cut1.id == "dummy-mono-cut-0010"
+        assert cut2.id == "dummy-mono-cut-0171"
+        assert cut3.id == "dummy-mono-cut-0009"
 
 
 def test_cut_set_decompose():
@@ -622,11 +702,26 @@ def test_cut_set_decompose_output_dir_doesnt_duplicate_recording():
         td = Path(td)
         cuts.decompose(output_dir=td)
 
-        text = load_jsonl(td / "recordings.jsonl.gz")
-        print(list(text))
-
         recs = load_manifest(td / "recordings.jsonl.gz")
         assert isinstance(recs, RecordingSet)
         # deduplicated recording
         assert len(recs) == 1
         assert recs[0].id == "dummy-recording-0000"
+
+
+def test_cut_set_from_files():
+    cs1 = DummyManifest(CutSet, begin_id=0, end_id=10)
+    cs2 = DummyManifest(CutSet, begin_id=10, end_id=20)
+    with NamedTemporaryFile(suffix=".jsonl.gz") as f1, NamedTemporaryFile(
+        suffix=".jsonl.gz"
+    ) as f2:
+        cs1.to_file(f1.name)
+        f1.flush()
+        cs2.to_file(f2.name)
+        f2.flush()
+
+        cs = CutSet.from_files([f1.name, f2.name], shuffle_iters=True, seed=0)
+        # __getitem__ with int index iterates lazy manifets
+        assert cs[0].id == "dummy-mono-cut-0000"
+        # On second iteration, we see a different order
+        assert cs[0].id == "dummy-mono-cut-0010"

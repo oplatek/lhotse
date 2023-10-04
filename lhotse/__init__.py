@@ -3,9 +3,11 @@ from .audio import (
     Recording,
     RecordingSet,
     set_audio_duration_mismatch_tolerance,
+    set_ffmpeg_torchaudio_info_enabled,
+    get_ffmpeg_torchaudio_info_enabled,
 )
 from .caching import is_caching_enabled, set_caching_enabled
-from .cut import CutSet, MonoCut, create_cut_set_eager, create_cut_set_lazy
+from .cut import CutSet, MonoCut, MultiCut, create_cut_set_eager, create_cut_set_lazy
 from .features import *
 from .kaldi import load_kaldi_data_dir
 from .manipulation import combine, split_parallelize_combine, to_manifest
@@ -24,16 +26,25 @@ from .utils import (
     measure_overlap,
     streaming_shuffle,
 )
+from .workflows import *
 
 try:
     # Try to get Lhotse's version (should be created during running pip install / python setup.py ...)
     from .version import __version__
 except:
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! #
-    # NOTE: REMEMBER TO UPDATE THE ACTUAL VERSION IN setup.py WHEN RELEASING #
-    # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! #
     # Use a default placeholder when the version is unavailable...
-    __version__ = "1.7.0.dev+missing.version.file"
+    from os import environ as _environ
+    from pathlib import Path as _Path
+
+    _base_version_path = _Path(".").parent / "VERSION"
+    if _base_version_path.is_file():
+        _base_version = open(_base_version_path).read().strip()
+        _dev_marker = ""
+        if not _environ.get("LHOTSE_PREPARING_RELEASE", False):
+            _dev_marker = ".dev"
+        __version__ = f"{_base_version}{_dev_marker}+missing.version.file"
+    else:
+        __version__ = f"0.0.0+unknown.version"
 
 from . import augmentation, dataset, features, recipes
 

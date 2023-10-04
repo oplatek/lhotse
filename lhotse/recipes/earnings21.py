@@ -28,10 +28,10 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download
 
 _DEFAULT_URL = (
     "https://codeload.github.com/revdotcom/speech-datasets/zip/refs/heads/main"
@@ -75,20 +75,17 @@ def download_earnings21(
     if completed_detector.is_file():
         logging.info(f"Skipping - {completed_detector} exists.")
         return extracted_dir
-
-    if force_download or not zip_path.is_file():
-        urlretrieve_progress(
-            url, filename=zip_path, desc="Getting speech-datasets-main.zip"
-        )
-
+    resumable_download(url, filename=zip_path, force_download=force_download)
     shutil.rmtree(extracted_dir, ignore_errors=True)
-
     with zipfile.ZipFile(zip_path) as zip:
         for f in zip.namelist():
             if "earnings21" in f:
                 zip.extract(f, path=target_dir)
 
-    shutil.move(target_dir / "speech-datasets-main" / "earnings21", target_dir)
+    # For Python < 3.9, shutil.move() gives error with PosixPath
+    shutil.move(
+        str(target_dir / "speech-datasets-main" / "earnings21"), str(target_dir)
+    )
     shutil.rmtree(target_dir / "speech-datasets-main")
 
     completed_detector.touch()
@@ -169,6 +166,7 @@ def prepare_earnings21(
         supervision_segments.append(s)
     supervision_set = SupervisionSet.from_segments(supervision_segments)
 
+    recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
     validate_recordings_and_supervisions(recording_set, supervision_set)
     if output_dir is not None:
         supervision_set.to_file(output_dir / "earnings21_supervisions_all.jsonl.gz")

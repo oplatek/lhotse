@@ -22,30 +22,21 @@ class CutPairsSampler(CutSampler):
         self,
         source_cuts: CutSet,
         target_cuts: CutSet,
-        max_source_frames: int = None,
-        max_source_samples: int = None,
         max_source_duration: Seconds = None,
-        max_target_frames: int = None,
-        max_target_samples: int = None,
-        max_target_duration: int = None,
+        max_target_duration: Seconds = None,
         max_cuts: Optional[int] = None,
         shuffle: bool = False,
         drop_last: bool = False,
         world_size: Optional[int] = None,
         rank: Optional[int] = None,
         seed: int = 0,
-        strict=None,
     ):
         """
         CutPairsSampler's constructor.
 
         :param source_cuts: the first ``CutSet`` to sample data from.
         :param target_cuts: the second ``CutSet`` to sample data from.
-        :param max_source_frames: The maximum total number of feature frames from ``source_cuts``.
-        :param max_source_samples: The maximum total number of audio samples from ``source_cuts``.
         :param max_source_duration: The maximum total recording duration from ``source_cuts``.
-        :param max_target_frames: The maximum total number of feature frames from ``target_cuts``.
-        :param max_target_samples: The maximum total number of audio samples from ``target_cuts``.
         :param max_target_duration: The maximum total recording duration from ``target_cuts``.
         :param max_cuts: The maximum number of cuts sampled to form a mini-batch.
             By default, this constraint is off.
@@ -70,22 +61,12 @@ class CutPairsSampler(CutSampler):
         # Constraints
         self.source_constraints = TimeConstraint(
             max_duration=max_source_duration,
-            max_samples=max_source_samples,
-            max_frames=max_source_frames,
             max_cuts=max_cuts,
         )
         self.target_constraints = TimeConstraint(
             max_duration=max_target_duration,
-            max_samples=max_target_samples,
-            max_frames=max_target_frames,
             max_cuts=max_cuts,
         )
-        if strict is not None:
-            warnings.warn(
-                "In Lhotse v1.4 all samplers act as if 'strict=True'. "
-                "Sampler's argument 'strict' will be removed in a future Lhotse release.",
-                category=DeprecationWarning,
-            )
 
     @property
     def remaining_duration(self) -> Optional[float]:
@@ -184,6 +165,11 @@ class CutPairsSampler(CutSampler):
         # Restored state with load_state_dict()? Skip resetting only this once.
         if self._just_restored_state:
             return self
+        # Why reset the current epoch?
+        # Either we are iterating the epoch for the first time and it's a no-op,
+        # or we are iterating the same epoch again, in which case setting more steps
+        # than are actually available per epoch would have broken the checkpoint restoration.
+        self.diagnostics.reset_current_epoch()
         # Reset the state to the beginning of the epoch.
         if self.shuffle:
             self.source_cuts.shuffle(self.seed + self.epoch)

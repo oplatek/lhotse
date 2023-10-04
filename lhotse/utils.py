@@ -1,13 +1,19 @@
+import ast
 import functools
+import hashlib
 import inspect
 import logging
 import math
+import os
 import random
+import sys
+import urllib
 import uuid
 import warnings
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_DOWN, ROUND_HALF_UP, Decimal
+from itertools import chain
 from math import ceil, isclose
 from pathlib import Path
 from typing import (
@@ -16,6 +22,7 @@ from typing import (
     Dict,
     Generator,
     Iterable,
+    Iterator,
     List,
     Optional,
     Sequence,
@@ -24,6 +31,7 @@ from typing import (
     Union,
 )
 
+import click
 import numpy as np
 import torch
 from tqdm.auto import tqdm
@@ -178,6 +186,10 @@ class TimeSpan:
     start: Seconds
     end: Seconds
 
+    @property
+    def duration(self) -> Seconds:
+        return self.end - self.start
+
 
 # TODO: Ugh, Protocols are only in Python 3.8+...
 def overlaps(lhs: Any, rhs: Any) -> bool:
@@ -190,9 +202,15 @@ def overlaps(lhs: Any, rhs: Any) -> bool:
     )
 
 
-def overspans(spanning: Any, spanned: Any) -> bool:
+def overspans(spanning: Any, spanned: Any, tolerance: float = 1e-3) -> bool:
     """Indicates whether the left-hand-side time-span/segment covers the whole right-hand-side time-span/segment."""
-    return spanning.start <= spanned.start <= spanned.end <= spanning.end
+    # We add a small epsilon to the comparison to avoid floating-point precision issues.
+    return (
+        spanning.start - tolerance
+        <= spanned.start
+        <= spanned.end
+        <= spanning.end + tolerance
+    )
 
 
 def time_diff_to_num_frames(
@@ -257,7 +275,12 @@ def fastcopy(dataclass_obj: T, **kwargs) -> T:
 
 
 def split_manifest_lazy(
-    it: Iterable[Any], output_dir: Pathlike, chunk_size: int, prefix: str = ""
+    it: Iterable[Any],
+    output_dir: Pathlike,
+    chunk_size: int,
+    prefix: str = "",
+    num_digits: int = 8,
+    start_idx: int = 0,
 ) -> List:
     """
     Splits a manifest (either lazily or eagerly opened) into chunks, each
@@ -274,6 +297,8 @@ def split_manifest_lazy(
         Each manifest is saved at: ``{output_dir}/{prefix}.{split_idx}.jsonl.gz``
     :param chunk_size: the number of items in each chunk.
     :param prefix: the prefix of each manifest.
+    :param num_digits: the width of ``split_idx``, which will be left padded with zeros to achieve it.
+    :param start_idx: The split index to start counting from (default is ``0``).
     :return: a list of lazily opened chunk manifests.
     """
     from lhotse.serialization import SequentialJsonlWriter
@@ -284,10 +309,8 @@ def split_manifest_lazy(
     if prefix == "":
         prefix = "split"
 
-    num_digits = 8
-
     items = iter(it)
-    split_idx = 1
+    split_idx = start_idx
     splits = []
     while True:
         try:
@@ -378,6 +401,19 @@ def compute_num_frames(
     return num_frames
 
 
+def compute_num_frames_from_samples(
+    num_samples: int,
+    frame_shift: Seconds,
+    sampling_rate: int,
+) -> int:
+    """
+    Compute the number of frames from number of samples and frame_shift in a safe way.
+    """
+    window_hop = round(frame_shift * sampling_rate)
+    num_frames = int((num_samples + window_hop // 2) // window_hop)
+    return num_frames
+
+
 def compute_num_windows(sig_len: Seconds, win_len: Seconds, hop: Seconds) -> int:
     """
     Return a number of windows obtained from signal of length equal to ``sig_len``
@@ -412,51 +448,147 @@ def during_docs_build() -> bool:
     return bool(os.environ.get("READTHEDOCS"))
 
 
-def tqdm_urlretrieve_hook(t):
-    """Wraps tqdm instance.
-    Don't forget to close() or __exit__()
-    the tqdm instance once you're done with it (easiest using `with` syntax).
-    Example
-    -------
-    >>> from urllib.request import urlretrieve
-    >>> with tqdm(...) as t:
-    ...     reporthook = tqdm_urlretrieve_hook(t)
-    ...     urlretrieve(..., reporthook=reporthook)
+def resumable_download(
+    url: str,
+    filename: Pathlike,
+    force_download: bool = False,
+    completed_file_size: Optional[int] = None,
+) -> None:
+    # Check if the file exists and get its size
+    file_exists = os.path.exists(filename)
+    if file_exists:
+        if force_download:
+            logging.info(
+                f"Removing existing file and downloading from scratch because force_download=True: {filename}"
+            )
+            os.unlink(filename)
+        file_size = os.path.getsize(filename)
 
-    Source: https://github.com/tqdm/tqdm/blob/master/examples/tqdm_wget.py
+        if completed_file_size and file_size == completed_file_size:
+            return
+    else:
+        file_size = 0
+
+    # Set the request headers to resume downloading
+    # Also set user-agent header to stop picky servers from complaining with 403
+    ua_headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_4) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.1 Safari/603.1.30",
+    }
+
+    headers = {
+        "Range": "bytes={}-".format(file_size),
+        **ua_headers,
+    }
+
+    # Create a request object with the URL and headers
+    req = urllib.request.Request(url, headers=headers)
+
+    # Open the file for writing in binary mode and seek to the end
+    # r+b is needed in order to allow seeking at the beginning of a file
+    # when downloading from scratch
+    mode = "r+b" if file_exists else "wb"
+    with open(filename, mode) as f:
+
+        def _download(rq, size):
+            f.seek(size, 0)
+            # just in case some garbage was written to the file, truncate it
+            f.truncate()
+
+            # Open the URL and read the contents in chunks
+            with urllib.request.urlopen(rq) as response:
+                chunk_size = 1024
+                total_size = int(response.headers.get("content-length", 0)) + size
+                with tqdm(
+                    total=total_size,
+                    initial=size,
+                    unit="B",
+                    unit_scale=True,
+                    desc=str(filename),
+                ) as pbar:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+
+        try:
+            _download(req, file_size)
+        except urllib.error.HTTPError as e:
+            # "Request Range Not Satisfiable" means the requested range
+            # starts after the file ends OR that the server does not support range requests.
+            if e.code == 416:
+                content_range = e.headers.get("Content-Range", None)
+                if content_range is None:
+                    # sometimes, the server actually supports range requests
+                    # but does not return the Content-Range header with 416 code
+                    # This is out of spec, but let us check twice for pragmatic reasons.
+                    head_req = urllib.request.Request(url, method="HEAD")
+                    head_res = urllib.request.urlopen(head_req)
+                    if head_res.headers.get("Accept-Ranges", "none") != "none":
+                        content_length = head_res.headers.get("Content-Length")
+                        content_range = f"bytes */{content_length}"
+
+                if content_range == f"bytes */{file_size}":
+                    # If the content-range returned by server also matches the file size,
+                    # then the file is already downloaded
+                    logging.info(f"File already downloaded: {filename}")
+                else:
+                    logging.info(
+                        "Server does not support range requests - attempting downloading from scratch"
+                    )
+                    _download(urllib.request.Request(url, headers=ua_headers), 0)
+            else:
+                raise e
+
+
+def _is_within_directory(directory: Path, target: Path):
+
+    abs_directory = directory.resolve()
+    abs_target = target.resolve()
+
+    return abs_directory in abs_target.parents
+
+
+def safe_extract(
+    tar: Any,
+    path: Pathlike = ".",
+    members: Optional[List[str]] = None,
+    *,
+    numeric_owner: bool = False,
+) -> None:
     """
-    last_b = [0]
-
-    def update_to(b=1, bsize=1, tsize=None):
-        """
-        b  : int, optional
-            Number of blocks transferred so far [default: 1].
-        bsize  : int, optional
-            Size of each block (in tqdm units) [default: 1].
-        tsize  : int, optional
-            Total size (in tqdm units). If [default: None] or -1,
-            remains unchanged.
-        """
-        if tsize not in (None, -1):
-            t.total = tsize
-        displayed = t.update((b - last_b[0]) * bsize)
-        last_b[0] = b
-        return displayed
-
-    return update_to
-
-
-def urlretrieve_progress(url, filename=None, data=None, desc=None):
+    Extracts a tar file in a safe way, avoiding path traversal attacks.
+    See: https://github.com/lhotse-speech/lhotse/pull/872
     """
-    Works exactly like urllib.request.urlretrieve, but attaches a tqdm hook to display
-    a progress bar of the download.
-    Use "desc" argument to display a user-readable string that informs what is being downloaded.
-    """
-    from urllib.request import urlretrieve
 
-    with tqdm(unit="B", unit_scale=True, unit_divisor=1024, miniters=1, desc=desc) as t:
-        reporthook = tqdm_urlretrieve_hook(t)
-        return urlretrieve(url=url, filename=filename, reporthook=reporthook, data=data)
+    path = Path(path)
+
+    for member in tar.getmembers():
+        member_path = path / member.name
+        if not _is_within_directory(path, member_path):
+            raise Exception("Attempted Path Traversal in Tar File")
+
+    tar.extractall(path, members, numeric_owner=numeric_owner)
+
+
+def safe_extract_rar(
+    rar: Any,
+    path: Pathlike = ".",
+    members: Optional[List[str]] = None,
+) -> None:
+    """
+    Extracts a rar file in a safe way, avoiding path traversal attacks.
+    """
+
+    path = Path(path)
+
+    for member in rar.infolist():
+        member_path = path / member.filename
+        if not _is_within_directory(path, member_path):
+            raise Exception("Attempted Path Traversal in Rar File")
+
+    rar.extractall(path, members)
 
 
 class nullcontext(AbstractContextManager):
@@ -491,7 +623,7 @@ def perturb_num_samples(num_samples: int, factor: float) -> int:
 
 
 def compute_num_samples(
-    duration: Seconds, sampling_rate: int, rounding=ROUND_HALF_UP
+    duration: Seconds, sampling_rate: Union[int, float], rounding=ROUND_HALF_UP
 ) -> int:
     """
     Convert a time quantity to the number of samples given a specific sampling rate.
@@ -553,6 +685,24 @@ def compute_start_duration_for_extended_cut(
     return round(new_start, ndigits=15), new_duration
 
 
+def merge_items_with_delimiter(
+    values: Iterable[str],
+    prefix: str = "cat",
+    delimiter: str = "#",
+    return_first: bool = False,
+) -> Optional[str]:
+    # e.g.
+    # values = ["1125-76840-0001", "1125-53670-0003"]
+    # return "cat#1125-76840-0001#1125-53670-0003"
+    # if return_first is True, return "1125-76840-0001"
+    values = list(values)
+    if len(values) == 0:
+        return None
+    if len(values) == 1 or return_first:
+        return values[0]
+    return delimiter.join(chain([prefix], values))
+
+
 def index_by_id_and_check(manifests: Iterable[T]) -> Dict[str, T]:
     id2man = {}
     for m in manifests:
@@ -609,6 +759,14 @@ def is_none_or_gt(value, threshold) -> bool:
     return value is None or value > threshold
 
 
+def is_equal_or_contains(
+    value: Union[T, Sequence[T]], other: Union[T, Sequence[T]]
+) -> bool:
+    value = to_list(value)
+    other = to_list(other)
+    return set(other).issubset(set(value))
+
+
 def is_module_available(*modules: str) -> bool:
     r"""Returns if a top-level module with :attr:`name` exists *without**
     importing it. This is generally safer than try-catch block around a
@@ -640,6 +798,23 @@ def measure_overlap(lhs: Any, rhs: Any) -> float:
 def ifnone(item: Optional[Any], alt_item: Any) -> Any:
     """Return ``alt_item`` if ``item is None``, otherwise ``item``."""
     return alt_item if item is None else item
+
+
+def to_list(item: Union[Any, Sequence[Any]]) -> List[Any]:
+    """Convert ``item`` to a list if it is not already a list."""
+    return item if isinstance(item, list) else [item]
+
+
+def to_hashable(item: Any) -> Any:
+    """Convert ``item`` to a hashable type if it is not already hashable."""
+    return tuple(item) if isinstance(item, list) else item
+
+
+def hash_str_to_int(s: str, max_value: Optional[int] = None) -> int:
+    """Hash a string to an integer in the range [0, max_value)."""
+    if max_value is None:
+        max_value = sys.maxsize
+    return int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16) % max_value
 
 
 def lens_to_mask(lens: torch.IntTensor) -> torch.Tensor:
@@ -739,7 +914,7 @@ class suppress_and_warn:
 
 
 def streaming_shuffle(
-    data: Iterable[T],
+    data: Iterator[T],
     bufsize: int = 10000,
     rng: Optional[random.Random] = None,
 ) -> Generator[T, None, None]:
@@ -773,8 +948,9 @@ def streaming_shuffle(
                 buf.append(next(data))
             except StopIteration:
                 pass
-        k = rng.randint(0, len(buf) - 1)
-        sample, buf[k] = buf[k], sample
+        if len(buf) > 0:
+            k = rng.randint(0, len(buf) - 1)
+            sample, buf[k] = buf[k], sample
         if startup and len(buf) < bufsize:
             buf.append(sample)
             continue
@@ -782,3 +958,133 @@ def streaming_shuffle(
         yield sample
     for sample in buf:
         yield sample
+
+
+def pairwise(iterable):
+    "s -> (s0,s1), (s1,s2), (s2, s3), ..."
+    from itertools import tee
+
+    a, b = tee(iterable)
+    next(b, None)
+    return zip(a, b)
+
+
+class Pipe:
+    """Wrapper class for subprocess.Pipe.
+
+    This class looks like a stream from the outside, but it checks
+    subprocess status and handles timeouts with exceptions.
+    This way, clients of the class do not need to know that they are
+    dealing with subprocesses.
+
+    Note: This class is based on WebDataset and modified here.
+    Original source is in https://github.com/webdataset/webdataset
+
+    :param *args: passed to `subprocess.Pipe`
+    :param **kw: passed to `subprocess.Pipe`
+    :param timeout: timeout for closing/waiting
+    :param ignore_errors: don't raise exceptions on subprocess errors
+    :param ignore_status: list of status codes to ignore
+    """
+
+    def __init__(
+        self,
+        *args,
+        mode: str,
+        timeout: float = 7200.0,
+        ignore_errors: bool = False,
+        ignore_status: Optional[List] = None,
+        **kw,
+    ):
+        """Create an IO Pipe."""
+        from subprocess import PIPE, Popen
+
+        self.ignore_errors = ignore_errors
+        # 0 => correct program exit
+        # 141 => broken pipe (e.g. because the main program was terminated)
+        self.ignore_status = [0, 141] + ifnone(ignore_status, [])
+        self.timeout = timeout
+        self.args = (args, kw)
+        if mode[0] == "r":
+            self.proc = Popen(*args, stdout=PIPE, text="b" not in mode, **kw)
+            self.stream = self.proc.stdout
+            if self.stream is None:
+                raise ValueError(f"{args}: couldn't open")
+        elif mode[0] == "w":
+            self.proc = Popen(*args, stdin=PIPE, text="b" not in mode, **kw)
+            self.stream = self.proc.stdin
+            if self.stream is None:
+                raise ValueError(f"{args}: couldn't open")
+        self.status = None
+
+    def __str__(self):
+        return f"<Pipe {self.args}>"
+
+    def check_status(self):
+        """Poll the process and handle any errors."""
+        status = self.proc.poll()
+        if status is not None:
+            self.wait_for_child()
+
+    def is_running(self) -> bool:
+        return self.proc.poll() is None
+
+    def wait_for_child(self):
+        """Check the status variable and raise an exception if necessary."""
+        if self.status is not None:
+            return
+        self.status = self.proc.wait()
+        if self.status not in self.ignore_status and not self.ignore_errors:
+            raise Exception(f"{self.args}: exit {self.status} (read)")
+
+    def read(self, *args, **kw):
+        """Wrap stream.read and checks status."""
+        result = self.stream.read(*args, **kw)
+        self.check_status()
+        return result
+
+    def write(self, *args, **kw):
+        """Wrap stream.write and checks status."""
+        result = self.stream.write(*args, **kw)
+        self.check_status()
+        return result
+
+    def readline(self, *args, **kw):
+        """Wrap stream.readLine and checks status."""
+        result = self.stream.readline(*args, **kw)
+        self.status = self.proc.poll()
+        self.check_status()
+        return result
+
+    def close(self):
+        """Wrap stream.close, wait for the subprocess, and handle errors."""
+        self.stream.close()
+        self.status = self.proc.wait(self.timeout)
+        self.wait_for_child()
+
+    def __iter__(self):
+        retval = self.readline()
+        while retval:
+            yield retval
+            retval = self.readline()
+
+    def __enter__(self):
+        """Context handler."""
+        return self
+
+    def __exit__(self, etype, value, traceback):
+        """Context handler."""
+        self.close()
+
+
+# Class to accept list of arguments as Click option
+class PythonLiteralOption(click.Option):
+    def type_cast_value(self, ctx, value):
+        try:
+            val = ast.literal_eval(value)
+            if isinstance(val, list) or isinstance(val, tuple):
+                return val[0] if len(val) == 1 else val
+            else:
+                return val
+        except:
+            return None

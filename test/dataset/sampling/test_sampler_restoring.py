@@ -12,7 +12,7 @@ from lhotse.dataset import (
     CutPairsSampler,
     DynamicBucketingSampler,
     RoundRobinSampler,
-    SingleCutSampler,
+    SimpleCutSampler,
     ZipSampler,
 )
 from lhotse.dataset.sampling.dynamic import DynamicCutSampler
@@ -23,15 +23,15 @@ CUTS_MOD = CUTS.modify_ids(lambda cid: cid + "_alt")
 
 # fmt: off
 SAMPLERS_TO_TEST = [
-    # Identically initialized SingleCutSampler
+    # Identically initialized SimpleCutSampler
     lambda: (
-        SingleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
-        SingleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
+        SimpleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
+        SimpleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
     ),
-    # Differently initialized SingleCutSampler with the same CUTS
+    # Differently initialized SimpleCutSampler with the same CUTS
     lambda: (
-        SingleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
-        SingleCutSampler(CUTS),
+        SimpleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
+        SimpleCutSampler(CUTS, max_duration=11.1),
     ),
     # Differently initialized CutPairsSampler with the same CUTS
     lambda: (
@@ -41,12 +41,12 @@ SAMPLERS_TO_TEST = [
     # Differently initialized ZipSampler with the same CUTS
     lambda: (
         ZipSampler(  # CUTS_SHUF just to randomize the order of the zipped-in cutset
-            SingleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
-            SingleCutSampler(CUTS_MOD, max_duration=10.0, shuffle=True, drop_last=True),
+            SimpleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
+            SimpleCutSampler(CUTS_MOD, max_duration=10.0, shuffle=True, drop_last=True),
         ),
         ZipSampler(
-            SingleCutSampler(CUTS),
-            SingleCutSampler(CUTS_MOD),
+            SimpleCutSampler(CUTS, max_duration=11.1),
+            SimpleCutSampler(CUTS_MOD, max_duration=11.1),
         ),
     ),
     # Differently initialized ZipSampler with the same CUTS (cut pairs)
@@ -63,7 +63,7 @@ SAMPLERS_TO_TEST = [
     # Differently initialized BucketingSampler with the same CUTS
     lambda: (
         BucketingSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True, num_buckets=2),
-        BucketingSampler(CUTS, num_buckets=2),
+        BucketingSampler(CUTS, max_duration=11.1, num_buckets=2),
     ),
     # Differently initialized BucketingSampler (using CutPairsSampler) with the same CUTS
     lambda: (
@@ -82,12 +82,12 @@ SAMPLERS_TO_TEST = [
     # Differently initialized RoundRobinSampler with the same CUTS
     lambda: (
         RoundRobinSampler(
-            SingleCutSampler(CUTS.subset(first=50), max_duration=10.0, shuffle=True, drop_last=True),
-            SingleCutSampler(CUTS_MOD.subset(first=50), max_duration=10.0, shuffle=True, drop_last=True),
+            SimpleCutSampler(CUTS.subset(first=50), max_duration=10.0, shuffle=True, drop_last=True),
+            SimpleCutSampler(CUTS_MOD.subset(first=50), max_duration=10.0, shuffle=True, drop_last=True),
         ),
         RoundRobinSampler(
-            SingleCutSampler(CUTS.subset(first=50)),
-            SingleCutSampler(CUTS_MOD.subset(first=50)),
+            SimpleCutSampler(CUTS.subset(first=50), max_duration=11.1),
+            SimpleCutSampler(CUTS_MOD.subset(first=50), max_duration=11.1),
         ),
     ),
 ]
@@ -226,20 +226,20 @@ class DummyDataset(torch.utils.data.Dataset):
 @pytest.mark.parametrize(
     "create_sampler",
     [
-        lambda: SingleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
+        lambda: SimpleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
         lambda: BucketingSampler(
             CUTS, max_duration=10.0, shuffle=True, drop_last=True, num_buckets=2
         ),
         lambda: ZipSampler(
-            SingleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
-            SingleCutSampler(CUTS_MOD, max_duration=10.0, shuffle=True, drop_last=True),
+            SimpleCutSampler(CUTS, max_duration=10.0, shuffle=True, drop_last=True),
+            SimpleCutSampler(CUTS_MOD, max_duration=10.0, shuffle=True, drop_last=True),
         ),
         lambda: RoundRobinSampler(
             # subset to first 50 cuts so that total num batches is 10, not 20
-            SingleCutSampler(
+            SimpleCutSampler(
                 CUTS.subset(first=50), max_duration=10.0, shuffle=True, drop_last=True
             ),
-            SingleCutSampler(
+            SimpleCutSampler(
                 CUTS_MOD.subset(first=50),
                 max_duration=10.0,
                 shuffle=True,
@@ -290,9 +290,7 @@ def test_e2e_restore_with_dataloader(num_workers, create_sampler):
         dset, batch_size=None, sampler=restored_sampler, num_workers=num_workers
     )
     batches = []
-    print(restored_dloader.sampler.remaining_cuts)
     for b in restored_dloader:
-        print(restored_dloader.sampler.remaining_cuts)
         batches.append(b)
 
     # Check that the results are the same.
@@ -310,3 +308,44 @@ def test_e2e_restore_with_dataloader(num_workers, create_sampler):
     restored_dloader.sampler.set_epoch(2)
     ep2_batches = list(restored_dloader)
     assert len(ep2_batches) == 10
+
+
+@pytest.mark.parametrize("create_samplers", SAMPLERS_TO_TEST)
+@pytest.mark.parametrize("advance_epoch", [True, False])
+def test_epoch_diagnostics_reset_on_start_of_iteration(create_samplers, advance_epoch):
+    # We only need one sampler for this test to check that it properly
+    # resets the cut/batch counter if we re-iterate over the same epoch
+    sampler, _ = create_samplers()
+
+    assert sampler.diagnostics.current_epoch == 0
+    assert sampler.diagnostics.total_cuts == 0
+    assert sampler.diagnostics.total_batches == 0
+
+    # Iterate a single epoch
+    for _ in sampler:
+        pass
+
+    assert sampler.diagnostics.current_epoch == 0
+    total_cuts_pass1 = sampler.diagnostics.total_cuts
+    total_batches_pass1 = sampler.diagnostics.total_batches
+
+    if advance_epoch:
+        sampler.set_epoch(1)
+
+    # if advance_epoch:
+    #   Iterate the next epoch, which should increment the next epoch stats
+    #   We expect the total sampler stats to be incremented
+    # else:
+    #   Iterate a single epoch again, which should reset the current stats
+    #   We expect the total sampler stats to be identical
+    for _ in sampler:
+        pass
+
+    if advance_epoch:
+        assert sampler.diagnostics.current_epoch == 1
+        assert sampler.diagnostics.total_cuts > total_cuts_pass1
+        assert sampler.diagnostics.total_batches > total_batches_pass1
+    else:
+        assert sampler.diagnostics.current_epoch == 0
+        assert sampler.diagnostics.total_cuts == total_cuts_pass1
+        assert sampler.diagnostics.total_batches == total_batches_pass1
