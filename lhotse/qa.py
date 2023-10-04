@@ -1,16 +1,16 @@
-from collections import defaultdict
 import logging
+from collections import defaultdict
 from math import isclose
-from typing import Any, Callable, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import numpy as np
 
 from lhotse.array import Array, TemporalArray
-from lhotse.audio import Recording, RecordingSet
-from lhotse.cut import Cut, CutSet, MixedCut, PaddingCut
-from lhotse.features import FeatureSet, Features
+from lhotse.audio import Recording, RecordingSet, get_audio_duration_mismatch_tolerance
+from lhotse.cut import Cut, CutSet, MixedCut, MonoCut, PaddingCut
+from lhotse.features import Features, FeatureSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import compute_num_frames
+from lhotse.utils import compute_num_frames, is_equal_or_contains, overlaps
 
 _VALIDATORS: Dict[str, Callable] = {}
 
@@ -61,13 +61,16 @@ def fix_manifests(
     recordings, supervisions = remove_missing_recordings_and_supervisions(
         recordings, supervisions
     )
-    if len(recordings) == 0 or len(supervisions) == 0:
-        raise ValueError(
-            "There are no matching recordings and supervisions in the input manifests."
-        )
+    # We don't use len(recordings) or len(supervisions) here because recordings and supervisions can be lazy.
+    assert (
+        len(frozenset(r.id for r in recordings)) > 0
+    ), "No recordings left after fixing the manifests."
+
     supervisions = trim_supervisions_to_recordings(recordings, supervisions)
-    if len(supervisions) == 0:
-        raise ValueError("All supervisions exceed the recordings duration.")
+    assert (
+        len(frozenset(s.id for s in supervisions)) > 0
+    ), "No supervisions left after fixing the manifests."
+
     return recordings, supervisions
 
 
@@ -103,7 +106,7 @@ def validate_recordings_and_supervisions(
             f"Supervision {s.id}: exceeded the bounds of its corresponding recording "
             f"(supervision spans [{s.start}, {s.end}]; recording spans [0, {r.duration}])"
         )
-        assert s.channel in r.channel_ids, (
+        assert is_equal_or_contains(r.channel_ids, s.channel), (
             f"Supervision {s.id}: channel {s.channel} does not exist in its corresponding Recording "
             f"(recording channels: {r.channel_ids})"
         )
@@ -146,11 +149,12 @@ def remove_missing_recordings_and_supervisions(
         )
     only_in_supervisions = recording_ids_in_sups - recording_ids
     if only_in_supervisions:
-        n_orig_sups = len(supervisions)
+        supervision_ids = frozenset(s.id for s in supervisions)
         supervisions = supervisions.filter(
             lambda s: s.recording_id not in only_in_supervisions
         )
-        n_removed_sups = n_orig_sups - len(supervisions)
+        supervision_ids_after = frozenset(s.id for s in supervisions)
+        n_removed_sups = len(supervision_ids) - len(supervision_ids_after)
         logging.warning(
             f"Removed {n_removed_sups} supervisions with no corresponding recordings "
             f"(for a total of {len(only_in_supervisions)} recording IDs)."
@@ -159,12 +163,16 @@ def remove_missing_recordings_and_supervisions(
 
 
 def trim_supervisions_to_recordings(
-    recordings: RecordingSet, supervisions: SupervisionSet
+    recordings: Union[Recording, RecordingSet],
+    supervisions: Iterable[SupervisionSegment],
+    verbose: bool = True,
 ) -> SupervisionSet:
     """
     Return a new :class:`~lhotse.supervision.SupervisionSet` with supervisions that are
     not exceeding the duration of their corresponding :class:`~lhotse.audio.Recording`.
     """
+    if isinstance(recordings, Recording):
+        recordings = RecordingSet.from_recordings([recordings])
     if recordings.is_lazy:
         recordings = RecordingSet.from_recordings(iter(recordings))
 
@@ -178,13 +186,13 @@ def trim_supervisions_to_recordings(
             continue
         if s.end > end:
             trimmed += 1
-            s = s.trim(recordings[s.recording_id].duration)
+            s = s.trim(end=end)
         sups.append(s)
-    if removed:
+    if verbose and removed:
         logging.warning(
             f"Removed {removed} supervisions starting after the end of the recording."
         )
-    if trimmed:
+    if verbose and trimmed:
         logging.warning(
             f"Trimmed {trimmed} supervisions exceeding the end of the recording."
         )
@@ -210,7 +218,9 @@ def validate_recording(r: Recording, read_data: bool = False) -> None:
     ), f"Recording {r.id}: duration has to be greater than 0 (is {r.duration})"
     expected_duration = r.num_samples / r.sampling_rate
     assert r.num_channels > 0, f"Recording {r.id}: no channels available"
-    assert isclose(expected_duration, r.duration), (
+    assert (
+        abs(expected_duration - r.duration) <= get_audio_duration_mismatch_tolerance()
+    ), (
         f"Recording {r.id}: mismatched declared duration ({r.duration}) with "
         f"num_samples / sampling_rate ({expected_duration})."
     )
@@ -370,7 +380,7 @@ def validate_cut(c: Cut, read_data: bool = False) -> None:
     # Conditions related to recording
     if c.has_recording:
         validate_recording(c.recording)
-        assert c.channel in c.recording.channel_ids
+        assert is_equal_or_contains(c.recording.channel_ids, c.channel)
         if read_data:
             # We are not passing "read_data" to "validate_recording" to avoid loading audio twice;
             # we'll just validate the subset of the recording relevant for the cut.
@@ -379,17 +389,26 @@ def validate_cut(c: Cut, read_data: bool = False) -> None:
                 c.num_samples == samples.shape[1]
             ), f"MonoCut {c.id}: expected {c.num_samples} samples, got {samples.shape[1]}"
 
-    # Conditions related to supervisions
-    for s in c.supervisions:
-        validate_supervision(s)
-        assert s.recording_id == c.recording_id, (
-            f"MonoCut {c.id}: supervision {s.id} has a mismatched recording_id "
-            f"(expected {c.recording_id}, supervision has {s.recording_id})"
-        )
-        assert s.channel == c.channel, (
-            f"MonoCut {c.id}: supervision {s.id} has a mismatched channel "
-            f"(expected {c.channel}, supervision has {s.channel})"
-        )
+    # Conditions related to supervisions.
+    # We only validate those for MonoCut; PaddingCut doesn't have supervisions,
+    # and MixedCut may consist of more than one recording/channel.
+    if isinstance(c, MonoCut):
+        for s in c.supervisions:
+            validate_supervision(s)
+            assert s.recording_id == c.recording_id, (
+                f"MonoCut {c.id}: supervision {s.id} has a mismatched recording_id "
+                f"(expected {c.recording_id}, supervision has {s.recording_id})"
+            )
+            # We want to ensure that the cut channel is same as supervision channel.
+            # But one or both of them can be a list.
+            # So we check that they are subsets of each other. This is a general way
+            # of checking set equality.
+            assert is_equal_or_contains(s.channel, c.channel) and is_equal_or_contains(
+                c.channel, s.channel
+            ), (
+                f"MonoCut {c.id}: supervision {s.id} has a mismatched channel "
+                f"(expected {c.channel}, supervision has {s.channel})"
+            )
 
     # Conditions related to custom fields
     if c.custom is not None:
@@ -408,6 +427,12 @@ def validate_cut(c: Cut, read_data: bool = False) -> None:
                         f"in custom field '{key}' (num_frames={value.num_frames} * "
                         f"frame_shift={value.frame_shift} == duration={value.duration})."
                     )
+                assert overlaps(c, value), (
+                    f"MonoCut {c.id}: TemporalArray at custom field '{key}' "
+                    "seems to have incorrect start time (the array with time span "
+                    f"[{value.start}s - {value.end}s] does not overlap with cut "
+                    f"with time span [{c.start}s - {c.end}s])."
+                )
 
 
 @register_validator
@@ -434,7 +459,9 @@ def validate_supervision_set(supervisions: SupervisionSet, **kwargs) -> None:
     for rid, sups in supervisions._segments_by_recording_id.items():
         cntr_per_channel = defaultdict(int)
         for s in sups:
-            cntr_per_channel[s.channel] += int(s.start == 0)
+            # channel can be an int or a list (in which case we convert it to a tuple)
+            c = s.channel if isinstance(s.channel, int) else tuple(s.channel)
+            cntr_per_channel[c] += int(s.start == 0)
         for channel, count in cntr_per_channel.items():
             if count > 1:
                 logging.warning(

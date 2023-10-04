@@ -12,49 +12,73 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+from tqdm.auto import tqdm
+
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
+
+
+def text_normalize(line: str):
+    """
+    Modified from https://github.com/wenet-e2e/wenet/blob/main/examples/multi_cn/s0/local/aishell_data_prep.sh#L54
+    sed 's/ａ/a/g' | sed 's/ｂ/b/g' |\
+    sed 's/ｃ/c/g' | sed 's/ｋ/k/g' |\
+    sed 's/ｔ/t/g' > $dir/transcripts.t
+
+    """
+    line = line.replace("ａ", "a")
+    line = line.replace("ｂ", "b")
+    line = line.replace("ｃ", "c")
+    line = line.replace("ｋ", "k")
+    line = line.replace("ｔ", "t")
+    line = line.upper()
+    return line
 
 
 def download_aishell(
     target_dir: Pathlike = ".",
-    force_download: Optional[bool] = False,
-    base_url: Optional[str] = "http://www.openslr.org/resources",
-) -> None:
+    force_download: bool = False,
+    base_url: str = "http://www.openslr.org/resources",
+) -> Path:
     """
     Downdload and untar the dataset
     :param target_dir: Pathlike, the path of the dir to storage the dataset.
     :param force_download: Bool, if True, download the tars no matter if the tars exist.
     :param base_url: str, the url of the OpenSLR resources.
+    :return: the path to downloaded and extracted directory with data.
     """
     url = f"{base_url}/33"
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+    corpus_dir = target_dir / "aishell"
     dataset_tar_name = "data_aishell.tgz"
     resources_tar_name = "resource_aishell.tgz"
     for tar_name in [dataset_tar_name, resources_tar_name]:
         tar_path = target_dir / tar_name
-        corpus_dir = target_dir / "aishell"
         extracted_dir = corpus_dir / tar_name[:-4]
         completed_detector = extracted_dir / ".completed"
         if completed_detector.is_file():
-            logging.info(f"Skipping download of because {completed_detector} exists.")
-            continue
-        if force_download or not tar_path.is_file():
-            urlretrieve_progress(
-                f"{url}/{tar_name}", filename=tar_path, desc=f"Downloading {tar_name}"
+            logging.info(
+                f"Skipping download of {tar_name} because {completed_detector} exists."
             )
+            continue
+        resumable_download(
+            f"{url}/{tar_name}", filename=tar_path, force_download=force_download
+        )
         shutil.rmtree(extracted_dir, ignore_errors=True)
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=corpus_dir)
+            safe_extract(tar, path=corpus_dir)
         if tar_name == dataset_tar_name:
             wav_dir = extracted_dir / "wav"
             for sub_tar_name in os.listdir(wav_dir):
                 with tarfile.open(wav_dir / sub_tar_name) as tar:
-                    tar.extractall(path=wav_dir)
+                    safe_extract(tar, path=wav_dir)
         completed_detector.touch()
+
+    return corpus_dir
 
 
 def prepare_aishell(
@@ -76,10 +100,16 @@ def prepare_aishell(
     with open(transcript_path, "r", encoding="utf-8") as f:
         for line in f.readlines():
             idx_transcript = line.split()
-            transcript_dict[idx_transcript[0]] = " ".join(idx_transcript[1:])
+            content = " ".join(idx_transcript[1:])
+            content = text_normalize(content)
+            transcript_dict[idx_transcript[0]] = content
     manifests = defaultdict(dict)
     dataset_parts = ["train", "dev", "test"]
-    for part in dataset_parts:
+    for part in tqdm(
+        dataset_parts,
+        desc="Process aishell audio, it takes about 102 seconds.",
+    ):
+        logging.info(f"Processing aishell subset: {part}")
         # Generate a mapping: utt_id -> (audio_path, audio_info, speaker, text)
         recordings = []
         supervisions = []
@@ -89,6 +119,7 @@ def prepare_aishell(
             speaker = audio_path.parts[-2]
             if idx not in transcript_dict:
                 logging.warning(f"No transcript: {idx}")
+                logging.warning(f"{audio_path} has no transcript.")
                 continue
             text = transcript_dict[idx]
             if not audio_path.is_file():
@@ -110,11 +141,14 @@ def prepare_aishell(
 
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
+        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
         validate_recordings_and_supervisions(recording_set, supervision_set)
 
         if output_dir is not None:
-            supervision_set.to_json(output_dir / f"supervisions_{part}.json")
-            recording_set.to_json(output_dir / f"recordings_{part}.json")
+            supervision_set.to_file(
+                output_dir / f"aishell_supervisions_{part}.jsonl.gz"
+            )
+            recording_set.to_file(output_dir / f"aishell_recordings_{part}.jsonl.gz")
 
         manifests[part] = {"recordings": recording_set, "supervisions": supervision_set}
 

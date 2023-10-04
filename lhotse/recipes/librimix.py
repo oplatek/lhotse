@@ -5,17 +5,17 @@ from pathlib import Path
 from typing import Dict, Optional, Union
 from zipfile import ZipFile
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import AudioSource, Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, Seconds, urlretrieve_progress
+from lhotse.utils import Pathlike, Seconds, resumable_download
 
 
 def download_librimix(
     target_dir: Pathlike = ".",
     force_download: Optional[bool] = False,
     url: Optional[str] = "https://zenodo.org/record/3871592/files/MiniLibriMix.zip",
-) -> None:
+) -> Path:
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     zip_path = target_dir / "MiniLibriMix.zip"
@@ -23,13 +23,17 @@ def download_librimix(
     completed_detector = unzipped_dir / ".completed"
     if completed_detector.is_file():
         logging.info(f"Skipping {zip_path} because {completed_detector} exists.")
-        return
-    if force_download or not zip_path.is_file():
-        urlretrieve_progress(url, filename=zip_path, desc="Downloading MiniLibriMix")
+        return unzipped_dir
+    resumable_download(
+        url,
+        filename=zip_path,
+        force_download=force_download,
+    )
     shutil.rmtree(unzipped_dir, ignore_errors=True)
     with ZipFile(zip_path) as zf:
         zf.extractall(path=target_dir)
     completed_detector.touch()
+    return unzipped_dir
 
 
 def prepare_librimix(
@@ -67,10 +71,17 @@ def prepare_librimix(
         if row["length"] / sampling_rate > min_segment_seconds
     )
     supervision_sources = make_corresponding_supervisions(audio_sources)
+
+    # Fix manifests and validate them
+    audio_sources, supervision_sources = fix_manifests(
+        audio_sources, supervision_sources
+    )
     validate_recordings_and_supervisions(audio_sources, supervision_sources)
     if output_dir is not None:
-        audio_sources.to_json(output_dir / "recordings_sources.json")
-        supervision_sources.to_json(output_dir / "supervisions_sources.json")
+        audio_sources.to_file(output_dir / "librimix_recordings_sources.jsonl.gz")
+        supervision_sources.to_file(
+            output_dir / "librimix_supervisions_sources.jsonl.gz"
+        )
     manifests["sources"] = {
         "recordings": audio_sources,
         "supervisions": supervision_sources,
@@ -94,10 +105,11 @@ def prepare_librimix(
             if row["length"] / sampling_rate > min_segment_seconds
         )
         supervision_mix = make_corresponding_supervisions(audio_mix)
+        audio_mix, supervision_mix = fix_manifests(audio_mix, supervision_mix)
         validate_recordings_and_supervisions(audio_mix, supervision_mix)
         if output_dir is not None:
-            audio_mix.to_json(output_dir / "recordings_mix.json")
-            supervision_mix.to_json(output_dir / "supervisions_mix.json")
+            audio_mix.to_file(output_dir / "librimix_recordings_mix.jsonl.gz")
+            supervision_mix.to_file(output_dir / "librimix_supervisions_mix.jsonl.gz")
         manifests["premixed"] = {
             "recordings": audio_mix,
             "supervisions": supervision_mix,
@@ -120,10 +132,13 @@ def prepare_librimix(
             if row["length"] / sampling_rate > min_segment_seconds
         )
         supervision_noise = make_corresponding_supervisions(audio_noise)
+        audio_noise, supervision_noise = fix_manifests(audio_noise, supervision_noise)
         validate_recordings_and_supervisions(audio_noise, supervision_noise)
         if output_dir is not None:
-            audio_noise.to_json(output_dir / "recordings_noise.json")
-            supervision_noise.to_json(output_dir / "supervisions_noise.json")
+            audio_noise.to_file(output_dir / "librimix_recordings_noise.jsonl.gz")
+            supervision_noise.to_file(
+                output_dir / "libirmix_supervisions_noise.jsonl.gz"
+            )
         manifests["noise"] = {
             "recordings": audio_noise,
             "supervisions": supervision_noise,

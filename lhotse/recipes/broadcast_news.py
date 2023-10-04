@@ -19,6 +19,7 @@ from cytoolz import sliding_window
 
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.utils import Pathlike, check_and_rglob, recursion_limit
 
@@ -65,14 +66,19 @@ def prepare_broadcast_news(
         chain.from_iterable(sups["segments"] for sups in supervisions_list)
     )
 
+    recordings, segment_supervisions = fix_manifests(recordings, segment_supervisions)
     validate_recordings_and_supervisions(recordings, segment_supervisions)
 
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        recordings.to_json(output_dir / "recordings.json")
-        section_supervisions.to_json(output_dir / "sections.json")
-        segment_supervisions.to_json(output_dir / "segments.json")
+        recordings.to_file(output_dir / "broadcast-news_recordings_all.jsonl.gz")
+        section_supervisions.to_file(
+            output_dir / "broadcast-news_sections_all.jsonl.gz"
+        )
+        segment_supervisions.to_file(
+            output_dir / "broadcast-news_segments_all.jsonl.gz"
+        )
 
     return {
         "recordings": recordings,

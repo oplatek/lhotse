@@ -21,6 +21,23 @@ Data structures used for describing supervisions in a dataset.
   :members:
   :inherited-members:
 
+Lhotse Shar -- sequential storage
+---------------------------------
+
+Lhotse Shar readers
+*******************
+
+.. automodule:: lhotse.shar.readers
+  :members:
+  :inherited-members:
+
+Lhotse Shar writers
+*******************
+
+.. automodule:: lhotse.shar.writers
+  :members:
+  :inherited-members:
+
 Feature extraction and manifests
 --------------------------------
 
@@ -36,9 +53,9 @@ Features API - extractor and manifests
 Lhotse's feature extractors
 ***************************
 
-.. autoclass:: lhotse.features.kaldi.extractors.KaldiFbank
+.. autoclass:: lhotse.features.kaldi.extractors.Fbank
 
-.. autoclass:: lhotse.features.kaldi.extractors.KaldiMfcc
+.. autoclass:: lhotse.features.kaldi.extractors.Mfcc
 
 Kaldi feature extractors as network layers
 ******************************************
@@ -125,4 +142,3 @@ Helper methods used throughout the codebase.
 .. automodule:: lhotse.manipulation
   :members:
   :inherited-members:
-

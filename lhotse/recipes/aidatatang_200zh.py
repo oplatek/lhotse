@@ -16,22 +16,26 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Optional, Union
 
+from tqdm.auto import tqdm
+
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 
 def download_aidatatang_200zh(
     target_dir: Pathlike = ".",
     force_download: Optional[bool] = False,
     base_url: Optional[str] = "http://www.openslr.org/resources",
-) -> None:
+) -> Path:
     """
     Downdload and untar the dataset
     :param target_dir: Pathlike, the path of the dir to store the dataset.
     :param force_download: Bool, if True, download the tars no matter if the tars exist.
     :param base_url: str, the url of the OpenSLR resources.
+    :return: the path to downloaded and extracted directory with data.
     """
     url = f"{base_url}/62"
     target_dir = Path(target_dir)
@@ -43,14 +47,13 @@ def download_aidatatang_200zh(
     completed_detector = extracted_dir / ".completed"
     if completed_detector.is_file():
         logging.info(f"Skipping because {completed_detector} exists.")
-        return
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(
-            f"{url}/{tar_name}", filename=tar_path, desc=f"Downloading {tar_name}"
-        )
+        return corpus_dir
+    resumable_download(
+        f"{url}/{tar_name}", filename=tar_path, force_download=force_download
+    )
     shutil.rmtree(extracted_dir, ignore_errors=True)
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=corpus_dir)
+        safe_extract(tar, path=corpus_dir)
 
     wav_dir = extracted_dir / "corpus"
     for s in ["test", "dev", "train"]:
@@ -58,8 +61,10 @@ def download_aidatatang_200zh(
         logging.info(f"Processing {d}")
         for sub_tar_name in os.listdir(d):
             with tarfile.open(d / sub_tar_name) as tar:
-                tar.extractall(path=d)
+                safe_extract(tar, path=d)
     completed_detector.touch()
+
+    return corpus_dir
 
 
 def prepare_aidatatang_200zh(
@@ -88,13 +93,19 @@ def prepare_aidatatang_200zh(
     with open(transcript_path, "r", encoding="utf-8") as f:
         for line in f.readlines():
             idx_transcript = line.split()
-            transcript_dict[idx_transcript[0]] = " ".join(idx_transcript[1:])
+            content = " ".join(idx_transcript[1:])
+            content = content.replace("Ａ", "A")
+            content = content.upper()
+            transcript_dict[idx_transcript[0]] = content
     manifests = defaultdict(dict)
     dataset_parts = ["dev", "test", "train"]
 
-    for part in dataset_parts:
+    for part in tqdm(
+        dataset_parts,
+        desc="Process aidatatang audio, it takes about 2559 seconds.",
+    ):
         # Generate a mapping: utt_id -> (audio_path, audio_info, speaker, text)
-        logging.info(f"Processing {part}")
+        logging.info(f"Processing  prepare_aidatatang_200zh subset: {part}")
         recordings = []
         supervisions = []
         wav_path = d / "corpus" / part
@@ -103,6 +114,7 @@ def prepare_aidatatang_200zh(
             speaker = audio_path.parts[-2]
             if idx not in transcript_dict:
                 logging.warning(f"No transcript: {idx}")
+                logging.warning(f"{audio_path} has no transcript. ")
                 continue
             text = transcript_dict[idx]
             if not audio_path.is_file():
@@ -124,11 +136,14 @@ def prepare_aidatatang_200zh(
 
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
+        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
         validate_recordings_and_supervisions(recording_set, supervision_set)
 
         if output_dir is not None:
-            supervision_set.to_json(output_dir / f"supervisions_{part}.json")
-            recording_set.to_json(output_dir / f"recordings_{part}.json")
+            supervision_set.to_file(
+                output_dir / f"aidatatang_supervisions_{part}.jsonl.gz"
+            )
+            recording_set.to_file(output_dir / f"aidatatang_recordings_{part}.jsonl.gz")
 
         manifests[part] = {"recordings": recording_set, "supervisions": supervision_set}
 

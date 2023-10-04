@@ -14,27 +14,51 @@ __all__ = ["ami"]
     "--annotations",
     type=click.Path(),
     default=None,
-    help="Provide if annotations are download in a different directory than corpus.",
+    help=(
+        "Provide if annotations are download in a different directory than" " corpus."
+    ),
 )
 @click.option(
     "--mic",
-    type=click.Choice(["ihm", "ihm-mix", "sdm", "mdm"], case_sensitive=False),
+    type=click.Choice(
+        ["ihm", "ihm-mix", "sdm", "mdm", "mdm8-bf"], case_sensitive=False
+    ),
     default="ihm",
     help="AMI microphone setting.",
 )
 @click.option(
     "--partition",
     type=click.Choice(
-        ["scenario-only", "full-corpus", "full-corpus-asr"], case_sensitive=False
+        ["scenario-only", "full-corpus", "full-corpus-asr"],
+        case_sensitive=False,
     ),
     default="full-corpus-asr",
-    help="Data partition to use (see http://groups.inf.ed.ac.uk/ami/corpus/datasets.shtml).",
+    help=(
+        "Data partition to use (see"
+        " http://groups.inf.ed.ac.uk/ami/corpus/datasets.shtml)."
+    ),
 )
 @click.option(
     "--normalize-text",
     type=click.Choice(["none", "upper", "kaldi"], case_sensitive=False),
     default="kaldi",
     help="Type of text normalization to apply (kaldi style, by default)",
+)
+@click.option(
+    "--max-words-per-segment",
+    type=int,
+    default=None,
+    help=(
+        "Maximum number of words per segment (similar to Kaldi-style"
+        " segmentation). If None, no segmentation is performed."
+    ),
+)
+@click.option(
+    "--merge-consecutive",
+    type=bool,
+    is_flag=True,
+    default=False,
+    help="Merge consecutive segments from the same speaker.",
 )
 def ami(
     corpus_dir: Pathlike,
@@ -43,6 +67,8 @@ def ami(
     mic: str,
     partition: str,
     normalize_text: bool,
+    max_words_per_segment: int,
+    merge_consecutive: bool,
 ):
     """AMI data preparation."""
     prepare_ami(
@@ -52,6 +78,8 @@ def ami(
         mic=mic,
         partition=partition,
         normalize_text=normalize_text,
+        max_words_per_segment=max_words_per_segment,
+        merge_consecutive=merge_consecutive,
     )
 
 
@@ -65,7 +93,9 @@ def ami(
 )
 @click.option(
     "--mic",
-    type=click.Choice(["ihm", "ihm-mix", "sdm", "mdm"], case_sensitive=False),
+    type=click.Choice(
+        ["ihm", "ihm-mix", "sdm", "mdm", "mdm8-bf"], case_sensitive=False
+    ),
     default="ihm",
     help="AMI microphone setting.",
 )
@@ -91,7 +121,7 @@ def ami(
     """AMI download."""
     download_ami(
         target_dir,
-        annotations_dir=annotations,
+        annotations=annotations,
         mic=mic,
         url=url,
         force_download=force_download,

@@ -1,18 +1,18 @@
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from decimal import ROUND_HALF_UP
-from typing import List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 
+from lhotse.augmentation.transform import AudioTransform
 from lhotse.utils import (
     Seconds,
     compute_num_samples,
     during_docs_build,
     perturb_num_samples,
 )
-from lhotse.augmentation.utils import convolve1d
 
 
 @dataclass
@@ -101,74 +101,6 @@ class SoxEffectTransform:
         ]
 
 
-class AudioTransform:
-    """
-    Base class for all audio transforms that are going to be lazily applied on
-    ``Recording`` during loading the audio into memory.
-
-    Any ``AudioTransform`` can be used like a Python function, that expects two arguments:
-    a numpy array of samples, and a sampling rate. E.g.:
-
-        >>> fn = AudioTransform.from_dict(...)
-        >>> new_audio = fn(audio, sampling_rate)
-
-    Since we often use cuts of the original recording, they will refer to the timestamps
-    of the augmented audio (which might be speed perturbed and of different duration).
-    Each transform provides a helper method to recover the original audio timestamps:
-
-        >>> # When fn does speed perturbation:
-        >>> fn.reverse_timestamps(offset=5.055555, duration=10.1111111, sampling_rate=16000)
-        ... (5.0, 10.0)
-
-    Furthermore, ``AudioTransform`` can be easily (de)serialized to/from dict
-    that contains its name and parameters.
-    This enables storing recording and cut manifests with the transform info
-    inside, avoiding the need to store the augmented recording version on disk.
-
-    All audio transforms derived from this class are "automagically" registered,
-    so that ``AudioTransform.from_dict()`` can "find" the right type given its name
-    to instantiate a specific transform object.
-    All child classes are expected to be decorated with a ``@dataclass`` decorator.
-    """
-
-    KNOWN_TRANSFORMS = {}
-
-    def __init_subclass__(cls, **kwargs):
-        if cls.__name__ not in AudioTransform.KNOWN_TRANSFORMS:
-            AudioTransform.KNOWN_TRANSFORMS[cls.__name__] = cls
-        super().__init_subclass__(**kwargs)
-
-    def to_dict(self) -> dict:
-        data = asdict(self)
-        return {"name": type(self).__name__, "kwargs": data}
-
-    @staticmethod
-    def from_dict(data: dict) -> "AudioTransform":
-        assert (
-            data["name"] in AudioTransform.KNOWN_TRANSFORMS
-        ), f"Unknown transform type: {data['name']}"
-        return AudioTransform.KNOWN_TRANSFORMS[data["name"]](**data["kwargs"])
-
-    def __call__(self, samples: np.ndarray, sampling_rate: int) -> np.ndarray:
-        """
-        Apply transform.
-
-        To be implemented in derived classes.
-        """
-        raise NotImplementedError
-
-    def reverse_timestamps(
-        self, offset: Seconds, duration: Optional[Seconds], sampling_rate: int
-    ) -> Tuple[Seconds, Optional[Seconds]]:
-        """
-        Convert ``offset`` and ``duration`` timestamps to be adequate for the audio before the transform.
-        Useful for on-the-fly augmentation when a particular chunk of audio needs to be read from disk.
-
-        To be implemented in derived classes.
-        """
-        raise NotImplementedError
-
-
 @dataclass
 class Speed(AudioTransform):
     """
@@ -181,16 +113,10 @@ class Speed(AudioTransform):
     factor: float
 
     def __call__(self, samples: np.ndarray, sampling_rate: int) -> np.ndarray:
-        check_torchaudio_version()
-        import torchaudio
-
-        sampling_rate = int(sampling_rate)  # paranoia mode
-        effect = [["speed", str(self.factor)], ["rate", str(sampling_rate)]]
-        if isinstance(samples, np.ndarray):
-            samples = torch.from_numpy(samples)
-        augmented, new_sampling_rate = torchaudio.sox_effects.apply_effects_tensor(
-            samples, sampling_rate, effect
+        resampler = get_or_create_resampler(
+            round(sampling_rate * self.factor), sampling_rate
         )
+        augmented = resampler(torch.from_numpy(samples))
         return augmented.numpy()
 
     def reverse_timestamps(
@@ -220,6 +146,25 @@ class Speed(AudioTransform):
         )
 
 
+_precompiled_resamplers: Dict[Tuple[int, int], torch.nn.Module] = {}
+
+
+def get_or_create_resampler(
+    source_sampling_rate: int, target_sampling_rate: int
+) -> torch.nn.Module:
+    global _precompiled_resamplers
+
+    tpl = (source_sampling_rate, target_sampling_rate)
+    if tpl not in _precompiled_resamplers:
+        check_torchaudio_version()
+        import torchaudio
+
+        _precompiled_resamplers[tpl] = torchaudio.transforms.Resample(
+            source_sampling_rate, target_sampling_rate
+        )
+    return _precompiled_resamplers[tpl]
+
+
 @dataclass
 class Resample(AudioTransform):
     """
@@ -230,20 +175,19 @@ class Resample(AudioTransform):
     target_sampling_rate: int
 
     def __post_init__(self):
-        # paranoia mode
         self.source_sampling_rate = int(self.source_sampling_rate)
         self.target_sampling_rate = int(self.target_sampling_rate)
+        self.resampler = get_or_create_resampler(
+            self.source_sampling_rate, self.target_sampling_rate
+        )
 
     def __call__(self, samples: np.ndarray, *args, **kwargs) -> np.ndarray:
-        check_torchaudio_version()
-        import torchaudio
+        if self.source_sampling_rate == self.target_sampling_rate:
+            return samples
 
-        effect = [["rate", str(self.target_sampling_rate)]]
         if isinstance(samples, np.ndarray):
             samples = torch.from_numpy(samples)
-        augmented, _ = torchaudio.sox_effects.apply_effects_tensor(
-            samples, self.source_sampling_rate, effect
-        )
+        augmented = self.resampler(samples)
         return augmented.numpy()
 
     def reverse_timestamps(
@@ -261,6 +205,9 @@ class Resample(AudioTransform):
         E.g. 16kHz, 235636 samples correspond to 14.72725s duration; after resampling to 22.05kHz,
         it is 324736 samples which correspond to 14.727256235827664s duration.
         """
+        if self.source_sampling_rate == self.target_sampling_rate:
+            return offset, duration
+
         old_num_samples = compute_num_samples(
             offset, self.source_sampling_rate, rounding=ROUND_HALF_UP
         )
@@ -362,93 +309,6 @@ class Volume(AudioTransform):
         """
         This method just returnes the original offset and duration as volume perturbation
         doesn't change any these audio properies.
-        """
-
-        return offset, duration
-
-
-@dataclass
-class ReverbWithImpulseResponse(AudioTransform):
-    """
-    Reverberation effect by convolving with a room impulse response.
-    This code is based on Kaldi's wav-reverberate utility:
-    https://github.com/kaldi-asr/kaldi/blob/master/src/featbin/wav-reverberate.cc
-
-    The impulse response can possibly be multi-channel, in which case the reverberated audio
-    will be multi-channel as well.
-    Note that we enforce the --shift-output option in Kaldi's wav-reverberate utility,
-    which means that the output length will be equal to the input length.
-    """
-
-    rir: dict
-    normalize_output: bool = True
-    early_only: bool = False
-
-    RIR_SCALING_FACTOR: float = 0.5 ** 15
-
-    def __post_init__(self):
-        if isinstance(self.rir, dict):
-            from lhotse import Recording
-
-            # Pass a shallow copy of the RIR dict since `from_dict()` pops the `sources` key.
-            self.rir = Recording.from_dict(self.rir.copy())
-
-    def __call__(
-        self,
-        samples: np.ndarray,
-        sampling_rate: int,
-    ) -> np.ndarray:
-        """
-        :param samples: The audio samples to reverberate (must be single-channel).
-        :param sampling_rate: The sampling rate of the audio samples.
-        """
-        assert samples.shape[0] == 1, "The input audio must be single-channel."
-        sampling_rate = int(sampling_rate)  # paranoia mode
-
-        rir_ = (
-            self.rir.load_audio()
-            if not self.early_only
-            else self.rir.load_audio(duration=0.05)
-        )
-
-        # Determine output length.
-        _, N_in = samples.shape
-        D, N_rir = rir_.shape
-        N_out = N_in  # Enforce shift output
-
-        # Initialize output matrix with the specified input channel.
-        augmented = np.zeros((D, N_out), dtype=samples.dtype)
-        power_before_reverb = np.sum(np.abs(samples) ** 2) / samples.shape[1]
-
-        for d in range(D):
-            augmented[d, :N_in] = samples
-            rir_d = rir_[d, :] * self.RIR_SCALING_FACTOR
-
-            # Convolve the signal with impulse response.
-            aug_d = convolve1d(
-                torch.from_numpy(samples[0]), torch.from_numpy(rir_d)
-            ).numpy()
-            shift_index = np.argmax(rir_d)
-            augmented[d, :] = aug_d[shift_index : shift_index + N_out]
-
-            if self.normalize_output:
-                power_after_reverb = (
-                    np.sum(np.abs(augmented[d, :]) ** 2) / augmented.shape[1]
-                )
-                if power_after_reverb > 0:
-                    augmented[d, :] *= np.sqrt(power_before_reverb / power_after_reverb)
-
-        return augmented
-
-    def reverse_timestamps(
-        self,
-        offset: Seconds,
-        duration: Optional[Seconds],
-        sampling_rate: Optional[int],  # Not used, made for compatibility purposes
-    ) -> Tuple[Seconds, Optional[Seconds]]:
-        """
-        This method just returns the original offset and duration since we have
-        implemented output shifting which preserves these properties.
         """
 
         return offset, duration

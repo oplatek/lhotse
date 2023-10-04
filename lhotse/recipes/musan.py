@@ -26,7 +26,7 @@ from lhotse import (
     validate,
     validate_recordings_and_supervisions,
 )
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 MUSAN_URL = "https://www.openslr.org/resources/17/musan.tar.gz"
 
@@ -35,7 +35,7 @@ def download_musan(
     target_dir: Pathlike = ".",
     url: Optional[str] = MUSAN_URL,
     force_download: Optional[bool] = False,
-) -> None:
+) -> Path:
     """
     Download and untar the MUSAN corpus.
 
@@ -48,15 +48,16 @@ def download_musan(
 
     tar_name = "musan.tar.gz"
     tar_path = target_dir / tar_name
+    corpus_dir = target_dir / "musan"
     completed_detector = target_dir / ".musan_completed"
     if completed_detector.is_file():
         logging.info(f"Skipping {tar_name} because {completed_detector} exists.")
-        return
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(url, filename=tar_path, desc=f"Downloading {tar_name}")
+        return corpus_dir
+    resumable_download(url, filename=tar_path, force_download=force_download)
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=target_dir)
+        safe_extract(tar, path=target_dir)
         completed_detector.touch()
+    return corpus_dir
 
 
 def prepare_musan(
@@ -88,7 +89,7 @@ def prepare_musan(
         output_dir.mkdir(parents=True, exist_ok=True)
         for part in manifests:
             for key, manifest in manifests[part].items():
-                manifest.to_json(output_dir / f"{key}_{part}.json")
+                manifest.to_file(output_dir / f"musan_{key}_{part}.jsonl.gz")
 
     return manifests
 

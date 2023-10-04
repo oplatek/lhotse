@@ -34,7 +34,8 @@ from lhotse import (
     SupervisionSet,
     validate_recordings_and_supervisions,
 )
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.qa import fix_manifests
+from lhotse.utils import Pathlike, resumable_download
 
 ADEPT_URL = "https://zenodo.org/record/5117102/files/ADEPT.zip"
 
@@ -42,12 +43,13 @@ ADEPT_URL = "https://zenodo.org/record/5117102/files/ADEPT.zip"
 def download_adept(
     target_dir: Pathlike = ".",
     force_download: bool = False,
-) -> None:
+) -> Path:
     """
     Download and untar the ADEPT dataset.
 
     :param target_dir: Pathlike, the path of the dir to storage the dataset.
     :param force_download: Bool, if True, download the tars no matter if the tars exist.
+    :return: the path to downloaded and extracted directory with data.
     """
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -56,19 +58,18 @@ def download_adept(
     completed_detector = corpus_dir / ".completed"
     if completed_detector.is_file():
         logging.info(f"Skipping downloading ADEPT because {completed_detector} exists.")
-        return
+        return corpus_dir
     # Maybe-download the archive.
     zip_name = "ADEPT.zip"
     zip_path = target_dir / zip_name
-    if force_download or not zip_path.is_file():
-        urlretrieve_progress(
-            ADEPT_URL, filename=zip_path, desc=f"Downloading {zip_name}"
-        )
+    resumable_download(ADEPT_URL, filename=zip_path, force_download=force_download)
     # Remove partial unpacked files, if any, and unpack everything.
     shutil.rmtree(corpus_dir, ignore_errors=True)
     with zipfile.ZipFile(zip_path) as zip_f:
         zip_f.extractall(path=corpus_dir)
     completed_detector.touch()
+
+    return corpus_dir
 
 
 def prepare_adept(
@@ -140,11 +141,12 @@ def prepare_adept(
         )
 
     supervisions = SupervisionSet.from_segments(supervisions)
+    recordings, supervisions = fix_manifests(recordings, supervisions)
     validate_recordings_and_supervisions(recordings, supervisions)
 
     if output_dir is not None:
         output_dir = Path(output_dir)
-        supervisions.to_file(output_dir / "adept_supervisions.json")
-        recordings.to_file(output_dir / "adept_recordings.json")
+        supervisions.to_file(output_dir / "adept_supervisions_all.jsonl.gz")
+        recordings.to_file(output_dir / "adept_recordings_all.jsonl.gz")
 
     return {"recordings": recordings, "supervisions": supervisions}

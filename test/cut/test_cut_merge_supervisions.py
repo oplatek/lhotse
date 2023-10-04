@@ -1,9 +1,17 @@
+import pytest
+
 from lhotse import CutSet
 from lhotse.cut import PaddingCut
-from lhotse.testing.dummies import DummyManifest, dummy_cut, dummy_supervision
+from lhotse.testing.dummies import (
+    DummyManifest,
+    dummy_cut,
+    dummy_multi_cut,
+    dummy_supervision,
+)
 
 
-def test_mono_cut_merge_supervisions():
+@pytest.mark.parametrize("merge_policy", ["delimiter", "keep_first"])
+def test_mono_cut_merge_supervisions(merge_policy):
     cut = dummy_cut(
         0,
         duration=10,
@@ -14,14 +22,13 @@ def test_mono_cut_merge_supervisions():
     )
     assert len(cut.supervisions) == 2
 
-    mcut = cut.merge_supervisions()
+    mcut = cut.merge_supervisions(merge_policy=merge_policy)
 
     # original not modified
     assert len(cut.supervisions) == 2
     assert len(mcut.supervisions) == 1
 
     s = mcut.supervisions[0]
-    assert s.id == "cat#dummy-segment-0000#dummy-segment-0001"
     assert s.recording_id == "dummy-recording-0000"  # not changed
     assert s.recording_id == cut.supervisions[0].recording_id
     assert s.start == 1
@@ -29,11 +36,19 @@ def test_mono_cut_merge_supervisions():
     assert s.duration == 7
     assert s.channel == 0
     assert s.text == "irrelevant irrelevant"
-    assert s.language == "cat#irrelevant#irrelevant"
-    assert s.speaker == "cat#irrelevant#irrelevant"
-    assert s.gender == "cat#irrelevant#irrelevant"
     assert s.custom is not None
-    assert s.custom["custom_field"] == "cat#irrelevant#irrelevant"
+    if merge_policy == "delimiter":
+        assert s.id == "cat#dummy-segment-0000#dummy-segment-0001"
+        assert s.language == "cat#irrelevant#irrelevant"
+        assert s.speaker == "cat#irrelevant#irrelevant"
+        assert s.gender == "cat#irrelevant#irrelevant"
+        assert s.custom["custom_field"] == "cat#irrelevant#irrelevant"
+    else:
+        assert s.id == "dummy-segment-0000"
+        assert s.language == "irrelevant"
+        assert s.speaker == "irrelevant"
+        assert s.gender == "irrelevant"
+        assert s.custom["custom_field"] == "irrelevant"
 
 
 def test_mono_cut_merge_supervisions_identity():
@@ -86,32 +101,41 @@ def test_padding_cut_merge_supervisions():
     assert cut == mcut
 
 
-def test_mixed_cut_merge_supervisions():
+@pytest.mark.parametrize("merge_policy", ["delimiter", "keep_first"])
+def test_mixed_cut_merge_supervisions(merge_policy):
     cut0 = dummy_cut(0, supervisions=[dummy_supervision(0)])
     cut1 = dummy_cut(1, supervisions=[dummy_supervision(1)])
     # overlapping supervisions -- note that we don't do anything smart for them.
     mixed = cut0.mix(cut1, offset_other_by=0.5)
     assert len(mixed.supervisions) == 2
 
-    mcut = mixed.merge_supervisions()
+    mcut = mixed.merge_supervisions(merge_policy=merge_policy)
 
     # original not modified
     assert len(mixed.supervisions) == 2
     assert len(mcut.supervisions) == 1
 
     s = mcut.supervisions[0]
-    assert s.id == "cat#dummy-segment-0000#dummy-segment-0001"
-    assert s.recording_id == "cat#dummy-recording-0000#dummy-recording-0001"
+    assert s.custom is not None
+    if merge_policy == "delimiter":
+        assert s.id == "cat#dummy-segment-0000#dummy-segment-0001"
+        assert s.recording_id == "cat#dummy-recording-0000#dummy-recording-0001"
+        assert s.language == "cat#irrelevant#irrelevant"
+        assert s.speaker == "cat#irrelevant#irrelevant"
+        assert s.gender == "cat#irrelevant#irrelevant"
+        assert s.custom["custom_field"] == "cat#irrelevant#irrelevant"
+    else:
+        assert s.id == "dummy-segment-0000"
+        assert s.recording_id == "dummy-recording-0000"
+        assert s.language == "irrelevant"
+        assert s.speaker == "irrelevant"
+        assert s.gender == "irrelevant"
+        assert s.custom["custom_field"] == "irrelevant"
     assert s.start == 0
     assert s.end == 1.5
     assert s.duration == 1.5
     assert s.channel == -1
     assert s.text == "irrelevant irrelevant"
-    assert s.language == "cat#irrelevant#irrelevant"
-    assert s.speaker == "cat#irrelevant#irrelevant"
-    assert s.gender == "cat#irrelevant#irrelevant"
-    assert s.custom is not None
-    assert s.custom["custom_field"] == "cat#irrelevant#irrelevant"
 
 
 def test_mixed_cut_merge_supervisions_identity():
@@ -119,6 +143,97 @@ def test_mixed_cut_merge_supervisions_identity():
     cut = cut.append(cut.drop_supervisions())
     mcut = cut.merge_supervisions()
     assert cut == mcut
+
+
+@pytest.mark.parametrize("merge_policy", ["delimiter", "keep_first"])
+def test_multi_cut_merge_supervisions_simple(merge_policy):
+    cut = dummy_multi_cut(
+        0,
+        duration=10,
+        supervisions=[
+            dummy_supervision(0, start=1, duration=2),
+            dummy_supervision(1, start=5, duration=3),
+        ],
+    )
+    assert len(cut.supervisions) == 2
+
+    mcut = cut.merge_supervisions(merge_policy=merge_policy)
+
+    # original not modified
+    assert len(cut.supervisions) == 2
+    assert len(mcut.supervisions) == 1
+
+    s = mcut.supervisions[0]
+    assert s.recording_id == "dummy-recording-0000"  # not changed
+    assert s.recording_id == cut.supervisions[0].recording_id
+    assert s.start == 1
+    assert s.end == 8
+    assert s.duration == 7
+    assert s.channel == [0]
+    assert s.text == "irrelevant irrelevant"
+    assert s.custom is not None
+    if merge_policy == "delimiter":
+        assert s.id == "cat#dummy-segment-0000#dummy-segment-0001"
+        assert s.language == "cat#irrelevant#irrelevant"
+        assert s.speaker == "cat#irrelevant#irrelevant"
+        assert s.gender == "cat#irrelevant#irrelevant"
+        assert s.custom["custom_field"] == "cat#irrelevant#irrelevant"
+    else:
+        assert s.id == "dummy-segment-0000"
+        assert s.language == "irrelevant"
+        assert s.speaker == "irrelevant"
+        assert s.gender == "irrelevant"
+        assert s.custom["custom_field"] == "irrelevant"
+
+
+@pytest.mark.parametrize("merge_channels", [True, False])
+def test_multi_cut_merge_supervisions_per_channel(merge_channels):
+    cut = dummy_multi_cut(
+        0,
+        duration=10,
+        supervisions=[
+            dummy_supervision(0, start=1, duration=2, channel=[0, 1]),
+            dummy_supervision(1, start=5, duration=3, channel=[0, 1]),
+            dummy_supervision(2, start=2, duration=3, channel=[5, 6]),
+        ],
+    )
+    assert len(cut.supervisions) == 3
+
+    mcut = cut.merge_supervisions(merge_channels=merge_channels)
+
+    # original not modified
+    assert len(cut.supervisions) == 3
+    assert len(mcut.supervisions) == (1 if merge_channels else 2)
+
+    s = mcut.supervisions[0]
+    if merge_channels:
+        assert s.id == "cat#dummy-segment-0000#dummy-segment-0002#dummy-segment-0001"
+        assert s.recording_id == "dummy-recording-0000"  # not changed
+        assert s.recording_id == cut.supervisions[0].recording_id
+        assert s.start == 1
+        assert s.end == 8
+        assert s.duration == 7
+        assert s.channel == [0, 1, 5, 6]
+        assert s.text == "irrelevant irrelevant irrelevant"
+        assert s.language == "cat#irrelevant#irrelevant#irrelevant"
+        assert s.speaker == "cat#irrelevant#irrelevant#irrelevant"
+        assert s.gender == "cat#irrelevant#irrelevant#irrelevant"
+        assert s.custom is not None
+        assert s.custom["custom_field"] == "cat#irrelevant#irrelevant#irrelevant"
+    else:
+        assert s.id == "cat#dummy-segment-0000#dummy-segment-0001"
+        assert s.recording_id == "dummy-recording-0000"  # not changed
+        assert s.recording_id == cut.supervisions[0].recording_id
+        assert s.start == 1
+        assert s.end == 8
+        assert s.duration == 7
+        assert s.channel == [0, 1]
+        assert s.text == "irrelevant irrelevant"
+        assert s.language == "cat#irrelevant#irrelevant"
+        assert s.speaker == "cat#irrelevant#irrelevant"
+        assert s.gender == "cat#irrelevant#irrelevant"
+        assert s.custom is not None
+        assert s.custom["custom_field"] == "cat#irrelevant#irrelevant"
 
 
 def test_cut_set_merge_supervisions():

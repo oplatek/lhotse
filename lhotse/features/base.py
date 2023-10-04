@@ -5,7 +5,7 @@ import warnings
 from abc import ABCMeta, abstractmethod
 from concurrent.futures.process import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, is_dataclass
-from itertools import chain
+from itertools import chain, islice
 from math import isclose
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Type, Union
@@ -17,12 +17,14 @@ from tqdm.auto import tqdm
 from lhotse.audio import Recording
 from lhotse.augmentation import AugmentFn
 from lhotse.features.io import FeaturesWriter, get_reader
-from lhotse.serialization import Serializable, load_yaml, save_to_yaml
+from lhotse.lazy import AlgorithmMixin
+from lhotse.serialization import LazyMixin, Serializable, load_yaml, save_to_yaml
 from lhotse.utils import (
     Pathlike,
     Seconds,
     asdict_nonull,
     compute_num_frames,
+    compute_num_frames_from_samples,
     exactly_one_not_null,
     fastcopy,
     ifnone,
@@ -138,12 +140,15 @@ class FeatureExtractor(metaclass=ABCMeta):
             np.ndarray, torch.Tensor, Sequence[np.ndarray], Sequence[torch.Tensor]
         ],
         sampling_rate: int,
+        lengths: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ) -> Union[np.ndarray, torch.Tensor, List[np.ndarray], List[torch.Tensor]]:
         """
         Performs batch extraction. It is not guaranteed to be faster
         than :meth:`FeatureExtractor.extract` -- it depends on whether
         the implementation of a particular feature extractor supports
-        accelerated batch computation.
+        accelerated batch computation. If `lengths` is provided, it is
+        assumed that the input is a batch of padded sequences, so we will
+        not perform any further collation.
 
         .. note::
             Unless overridden by child classes, it defaults to sequentially
@@ -155,22 +160,34 @@ class FeatureExtractor(metaclass=ABCMeta):
         input_is_list = False
         input_is_torch = False
 
-        if isinstance(samples, list):
-            input_is_list = True
-            pass  # nothing to do with `samples`
-        elif samples.ndim > 1:
-            samples = list(samples)
+        if lengths is not None:
+            feat_lens = [
+                compute_num_frames_from_samples(l, self.frame_shift, sampling_rate)
+                for l in lengths
+            ]
+            assert isinstance(
+                samples, torch.Tensor
+            ), "If `lengths` is provided, `samples` must be a batched and padded torch.Tensor."
         else:
-            # The user passed an array/tensor of shape (num_samples,)
-            samples = [samples.reshape(1, -1)]
+            if isinstance(samples, list):
+                input_is_list = True
+                pass  # nothing to do with `samples`
+            elif samples.ndim > 1:
+                samples = list(samples)
+            else:
+                # The user passed an array/tensor of shape (num_samples,)
+                samples = [samples.reshape(1, -1)]
 
-        if any(isinstance(x, torch.Tensor) for x in samples):
-            samples = [x.numpy() for x in samples]
-            input_is_torch = True
+            if any(isinstance(x, torch.Tensor) for x in samples):
+                samples = [x.numpy() for x in samples]
+                input_is_torch = True
 
         result = []
         for item in samples:
-            result.append(self.extract(item, sampling_rate=sampling_rate))
+            res = self.extract(item, sampling_rate=sampling_rate)
+            if lengths is not None:
+                res = res[: feat_lens[len(result)]]
+            result.append(res)
 
         if input_is_torch:
             result = [torch.from_numpy(x) for x in result]
@@ -195,7 +212,7 @@ class FeatureExtractor(metaclass=ABCMeta):
         storage: FeaturesWriter,
         sampling_rate: int,
         offset: Seconds = 0,
-        channel: Optional[int] = None,
+        channel: Optional[Union[int, List[int]]] = None,
         augment_fn: Optional[AugmentFn] = None,
     ) -> "Features":
         """
@@ -216,7 +233,7 @@ class FeatureExtractor(metaclass=ABCMeta):
         :param storage: a ``FeaturesWriter`` object that will handle storing the feature matrices.
         :param offset: an offset in seconds for where to start reading the recording - when used for
             ``Cut`` feature extraction, must be equal to ``Cut.start``.
-        :param channel: an optional channel number to insert into ``Features`` manifest.
+        :param channel: an optional channel number(s) to insert into ``Features`` manifest.
         :param augment_fn: an optional ``WavAugmenter`` instance to modify the waveform before feature extraction.
         :return: a ``Features`` manifest item for the extracted feature matrix (it is not written to disk).
         """
@@ -445,6 +462,7 @@ class Features:
         self,
         start: Optional[Seconds] = None,
         duration: Optional[Seconds] = None,
+        channel_id: Union[int, List[int]] = 0,
     ) -> np.ndarray:
         # noinspection PyArgumentList
         storage = get_reader(self.storage_type)(self.storage_path)
@@ -482,18 +500,27 @@ class Features:
         self,
         start: Seconds = 0,
         duration: Optional[Seconds] = None,
+        lilcom: bool = False,
     ) -> "Features":
         from lhotse.features.io import get_memory_writer
 
+        if self.storage_type in ("memory_lilcom", "memory_writer"):
+            return self  # nothing to do
+
         arr = self.load(start=start, duration=duration)
-        if issubclass(arr.dtype.type, np.floating):
+        if issubclass(arr.dtype.type, np.floating) and lilcom:
             writer = get_memory_writer("memory_lilcom")()
         else:
             writer = get_memory_writer("memory_raw")()
         data = writer.write("", arr)  # key is ignored by in memory writers
         return fastcopy(
             self,
-            start=start if not isclose(start, 0) else self.start,
+            # note: to understand why start is set to zero here, consider two cases:
+            # 1) this method moves the whole array to memory => the start was 0 anyway
+            # 2) this method moves a subset of the array to memory => the manifest is
+            #    now relative to the start of that subset, and since it describes the
+            #    whole subset, start=0 and duration=self.duration
+            start=0.0,
             duration=ifnone(duration, self.duration),
             num_frames=arr.shape[0],
             storage_type=writer.name,
@@ -536,10 +563,34 @@ class Features:
             data["frame_shift"] = round(
                 data["duration"] / data["num_frames"], ndigits=3
             )
+        if (
+            "storage_key" in data
+            and "storage_type" in data
+            and "storage_path" not in data
+        ):
+            data["storage_path"] = None
         return Features(**data)
 
+    def __repr__(self):
+        return (
+            f"Features("
+            f"type='{self.type}', "
+            f"num_frames={self.num_frames}, "
+            f"num_features={self.num_features}, "
+            f"frame_shift={self.frame_shift}, "
+            f"sampling_rate={self.sampling_rate}, "
+            f"start={self.start}, "
+            f"duration={self.duration}, "
+            f"storage_type='{self.storage_type}', "
+            f"storage_path='{self.storage_path}', "
+            f"storage_key='{self.storage_key if isinstance(self.storage_key, str) else '<binary-data>'}', "
+            f"recording_id='{self.recording_id}', "
+            f"channels={self.channels}"
+            f")"
+        )
 
-class FeatureSet(Serializable, Sequence[Features]):
+
+class FeatureSet(Serializable, AlgorithmMixin):
     """
     Represents a feature manifest, and allows to read features for given recordings
     within particular channels and time ranges.
@@ -547,10 +598,8 @@ class FeatureSet(Serializable, Sequence[Features]):
     When a given recording/time-range/channel is unavailable, raises a KeyError.
     """
 
-    def __init__(self, features: List[Features] = None) -> None:
+    def __init__(self, features: Optional[List[Features]] = None) -> None:
         self.features = ifnone(features, [])
-        if isinstance(self.features, list):
-            self.features = sorted(self.features)
 
     def __eq__(self, other: "FeatureSet") -> bool:
         return self.features == other.features
@@ -561,8 +610,12 @@ class FeatureSet(Serializable, Sequence[Features]):
         return self.features
 
     @staticmethod
-    def from_features(features: Iterable[Features]) -> "FeatureSet":
-        return FeatureSet(list(features))  # just for consistency with other *Sets
+    def from_features(features: Union[Iterable[Features], LazyMixin]) -> "FeatureSet":
+        return (
+            FeatureSet([f for f in features])
+            if isinstance(features, LazyMixin)
+            else FeatureSet(list(features))
+        )
 
     from_items = from_features
 
@@ -599,7 +652,9 @@ class FeatureSet(Serializable, Sequence[Features]):
             )
         ]
 
-    def split_lazy(self, output_dir: Pathlike, chunk_size: int) -> List["FeatureSet"]:
+    def split_lazy(
+        self, output_dir: Pathlike, chunk_size: int, prefix: str = ""
+    ) -> List["FeatureSet"]:
         """
         Splits a manifest (either lazily or eagerly opened) into chunks, each
         with ``chunk_size`` items (except for the last one, typically).
@@ -612,11 +667,17 @@ class FeatureSet(Serializable, Sequence[Features]):
 
         :param it: any iterable of Lhotse manifests.
         :param output_dir: directory where the split manifests are saved.
-            Each manifest is saved at: ``{output_dir}/{split_idx}.jsonl.gz``
+            Each manifest is saved at: ``{output_dir}/{prefix}.{split_idx}.jsonl.gz``
         :param chunk_size: the number of items in each chunk.
+        :param prefix: the prefix of each manifest.
         :return: a list of lazily opened chunk manifests.
         """
-        return split_manifest_lazy(self, output_dir=output_dir, chunk_size=chunk_size)
+        return split_manifest_lazy(
+            self, output_dir=output_dir, chunk_size=chunk_size, prefix=prefix
+        )
+
+    def shuffle(self, *args, **kwargs):
+        raise NotImplementedError("FeatureSet does not support shuffling.")
 
     def subset(
         self, first: Optional[int] = None, last: Optional[int] = None
@@ -635,13 +696,12 @@ class FeatureSet(Serializable, Sequence[Features]):
 
         if first is not None:
             assert first > 0
-            if first > len(self):
+            out = FeatureSet.from_items(islice(self, first))
+            if len(out) < first:
                 logging.warning(
-                    f"FeatureSet has only {len(self)} items but first {first} required; "
-                    f"not doing anything."
+                    f"FeatureSet has only {len(out)} items but first {first} were requested."
                 )
-                return self
-            return FeatureSet.from_features(self.features[:first])
+            return out
 
         if last is not None:
             assert last > 0
@@ -656,7 +716,7 @@ class FeatureSet(Serializable, Sequence[Features]):
     def find(
         self,
         recording_id: str,
-        channel_id: int = 0,
+        channel_id: Union[int, List[int]] = 0,
         start: Seconds = 0.0,
         duration: Optional[Seconds] = None,
         leeway: Seconds = 0.05,
@@ -723,7 +783,7 @@ class FeatureSet(Serializable, Sequence[Features]):
     def load(
         self,
         recording_id: str,
-        channel_id: int = 0,
+        channel_id: Union[int, List[int]] = 0,
         start: Seconds = 0.0,
         duration: Optional[Seconds] = None,
     ) -> np.ndarray:
@@ -775,13 +835,6 @@ class FeatureSet(Serializable, Sequence[Features]):
 
     def __len__(self) -> int:
         return len(self.features)
-
-    def __add__(self, other: "FeatureSet") -> "FeatureSet":
-        from lhotse.serialization import LazyIteratorChain
-
-        if self.is_lazy or other.is_lazy:
-            return FeatureSet(LazyIteratorChain(self.features, other.features))
-        return FeatureSet(features=self.features + other.features)
 
 
 class FeatureSetBuilder:
@@ -891,39 +944,60 @@ def compute_global_stats(
     """
     feature_manifests = iter(feature_manifests)
     first = next(feature_manifests)
-    total_sum = np.zeros((first.num_features,), dtype=np.float64)
-    total_unnorm_var = np.zeros((first.num_features,), dtype=np.float64)
-    total_frames = 0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        for features in chain([first], feature_manifests):
-            # Read the features
-            arr = features.load().astype(np.float64)
+    stats = StatsAccumulator(feature_dim=first.num_features)
+    for features in chain([first], feature_manifests):
+        # Read the features
+        arr = features.load().astype(np.float64)
+        # Update
+        stats.update(arr)
+    mvn = stats.get()
+    if storage_path is not None:
+        with open(storage_path, "wb") as f:
+            pickle.dump(mvn, f)
+    return mvn
+
+
+class StatsAccumulator:
+    def __init__(self, feature_dim: int):
+        self.total_sum = np.zeros((feature_dim,), dtype=np.float64)
+        self.total_unnorm_var = np.zeros((feature_dim,), dtype=np.float64)
+        self.total_frames = 0
+
+    def update(self, arr: np.ndarray) -> None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            arr = arr.astype(np.float64)
             # Update the sum for the means
             curr_sum = arr.sum(axis=0)
-            updated_total_sum = total_sum + curr_sum
+            updated_total_sum = self.total_sum + curr_sum
             # Update the number of frames
             curr_frames = arr.shape[0]
-            updated_total_frames = total_frames + curr_frames
+            updated_total_frames = self.total_frames + curr_frames
             # Update the unnormalized variance
-            total_over_curr_frames = total_frames / curr_frames
+            total_over_curr_frames = self.total_frames / curr_frames
             curr_unnorm_var = np.var(arr, axis=0) * curr_frames
-            if total_frames > 0:
-                total_unnorm_var = (
-                    total_unnorm_var
+            if self.total_frames > 0:
+                self.total_unnorm_var = (
+                    self.total_unnorm_var
                     + curr_unnorm_var
                     + total_over_curr_frames
                     / updated_total_frames
-                    * (total_sum / total_over_curr_frames - curr_sum) ** 2
+                    * (self.total_sum / total_over_curr_frames - curr_sum) ** 2
                 )
             else:
-                total_unnorm_var = curr_unnorm_var
-            total_sum = updated_total_sum
-            total_frames = updated_total_frames
-    stats = {
-        "norm_means": total_sum / total_frames,
-        "norm_stds": np.sqrt(total_unnorm_var / total_frames),
-    }
-    if storage_path is not None:
-        with open(storage_path, "wb") as f:
-            pickle.dump(stats, f)
-    return stats
+                self.total_unnorm_var = curr_unnorm_var
+            self.total_sum = updated_total_sum
+            self.total_frames = updated_total_frames
+
+    @property
+    def norm_means(self) -> np.ndarray:
+        return self.total_sum / self.total_frames
+
+    @property
+    def norm_stds(self) -> np.ndarray:
+        return np.sqrt(self.total_unnorm_var / self.total_frames)
+
+    def get(self) -> Dict[str, np.ndarray]:
+        return {
+            "norm_means": self.norm_means,
+            "norm_stds": self.norm_stds,
+        }

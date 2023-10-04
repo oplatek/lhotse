@@ -1,5 +1,5 @@
-import threading
 import queue
+import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Callable, Generator, Iterable
 
@@ -68,7 +68,7 @@ class SubmitterThread(threading.Thread):
         self.use_threads = threads
 
     def run(self) -> None:
-        executor = ProcessPoolExecutor if self.use_threads else ThreadPoolExecutor
+        executor = ThreadPoolExecutor if self.use_threads else ProcessPoolExecutor
         with executor(self.num_jobs) as ex:
             for args in zip(*self.iterables):
                 future = ex.submit(self.fn, *args)

@@ -3,23 +3,20 @@ import warnings
 from bisect import bisect_right
 from collections import deque
 from itertools import islice
-from typing import (
-    Deque,
-    Generator,
-    Iterable,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import Any, Deque, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 
 from lhotse import CutSet, Seconds
 from lhotse.cut import Cut
-from lhotse.dataset.sampling import streaming_shuffle
-from lhotse.dataset.sampling.base import CutSampler, TimeConstraint
-from lhotse.dataset.sampling.dynamic import DurationBatcher
+from lhotse.dataset.sampling.base import (
+    CutSampler,
+    EpochDiagnostics,
+    SamplingDiagnostics,
+    TimeConstraint,
+)
+from lhotse.dataset.sampling.dynamic import DurationBatcher, Filter
+from lhotse.utils import ifnone, streaming_shuffle
 
 
 class DynamicBucketingSampler(CutSampler):
@@ -65,23 +62,28 @@ class DynamicBucketingSampler(CutSampler):
 
     def __init__(
         self,
-        *cuts: CutSet,
+        *cuts: Iterable[Cut],
         max_duration: float,
+        max_cuts: Optional[int] = None,
         num_buckets: int = 10,
         shuffle: bool = False,
         drop_last: bool = False,
         consistent_ids: bool = True,
         num_cuts_for_bins_estimate: int = 10000,
         buffer_size: int = 10000,
-        shuffle_buffer_size: int = 1000,
+        shuffle_buffer_size: int = 20000,
+        quadratic_duration: Optional[Seconds] = None,
         world_size: Optional[int] = None,
         rank: Optional[int] = None,
         seed: int = 0,
+        strict=None,
     ) -> None:
         """
         :param cuts: one or more CutSets (when more than one, will yield tuples of CutSets as mini-batches)
         :param max_duration: The maximum total recording duration from ``cuts``.
             Note: with multiple CutSets, ``max_duration`` constraint applies only to the first CutSet.
+        :param max_cuts: The maximum total number of ``cuts`` per batch.
+            When only ``max_duration`` is specified, this sampler yields static batch sizes.
         :param num_buckets: how many buckets to create.
         :param shuffle: When ``True``, the cuts will be shuffled dynamically with
             a reservoir-sampling-based algorithm.
@@ -104,12 +106,17 @@ class DynamicBucketingSampler(CutSampler):
         :param shuffle_buffer_size: How many cuts (or cut pairs, triplets) are being held in memory
             a buffer used for streaming shuffling. Larger number means better randomness at the cost
             of higher memory usage.
+        :param quadratic_duration: When set, it adds an extra penalty that's quadratic in size w.r.t.
+            a cuts duration. This helps get a more even GPU utilization across different input lengths
+            when models have quadratic input complexity. Set between 15 and 40 for transformers.
         :param world_size: Total number of distributed nodes. We will try to infer it by default.
         :param rank: Index of distributed node. We will try to infer it by default.
         :param seed: Random seed used to consistently shuffle the dataset across different processes.
         """
-        super().__init__(world_size=world_size, rank=rank, seed=seed)
-        if not all(cs.is_lazy for cs in cuts):
+        super().__init__(
+            drop_last=drop_last, world_size=world_size, rank=rank, seed=seed
+        )
+        if not all(cs.is_lazy for cs in cuts if isinstance(cs, CutSet)):
             warnings.warn(
                 "You are using DynamicBucketingSampler with an eagerly read CutSet. "
                 "You won't see any memory/speed benefits with that setup. "
@@ -117,13 +124,24 @@ class DynamicBucketingSampler(CutSampler):
             )
         self.cuts = cuts
         self.max_duration = max_duration
+        self.max_cuts = max_cuts
         self.shuffle = shuffle
-        self.drop_last = drop_last
         self.consistent_ids = consistent_ids
         self.num_cuts_for_bins_estimate = num_cuts_for_bins_estimate
         self.buffer_size = buffer_size
         self.shuffle_buffer_size = shuffle_buffer_size
+        self.quadratic_duration = quadratic_duration
         self.rng = None
+        assert any(
+            v is not None for v in (self.max_duration, self.max_cuts)
+        ), "At least one of max_duration or max_cuts has to be set."
+
+        if strict is not None:
+            warnings.warn(
+                "In Lhotse v1.4 all samplers act as if 'strict=True'. "
+                "Sampler's argument 'strict' will be removed in a future Lhotse release.",
+                category=DeprecationWarning,
+            )
 
         if self.shuffle:
             cuts_for_bins_estimate = streaming_shuffle(
@@ -138,8 +156,59 @@ class DynamicBucketingSampler(CutSampler):
             num_buckets=num_buckets,
         )
 
+    def state_dict(self) -> Dict[str, Any]:
+        sd = super().state_dict()
+        sd.update(
+            {
+                "max_duration": self.max_duration,
+                "max_cuts": self.max_cuts,
+                "consistent_ids": self.consistent_ids,
+                "buffer_size": self.buffer_size,
+                "num_cuts_for_bins_estimate": self.num_cuts_for_bins_estimate,
+                "shuffle_buffer_size": self.shuffle_buffer_size,
+                "quadratic_duration": self.quadratic_duration,
+            }
+        )
+        return sd
+
+    def load_state_dict(self, sd: Dict[str, Any]) -> None:
+        self.max_duration = sd.pop("max_duration")
+        self.max_cuts = sd.pop("max_cuts")
+        self.consistent_ids = sd.pop("consistent_ids")
+        self.num_cuts_for_bins_estimate = sd.pop("num_cuts_for_bins_estimate")
+        self.buffer_size = sd.pop("buffer_size")
+        self.shuffle_buffer_size = sd.pop("shuffle_buffer_size")
+        self.quadratic_duration = sd.pop("quadratic_duration", None)
+        sd.pop("strict", None)  # backward compatibility
+        super().load_state_dict(sd)
+        self._fast_forward()
+
+    def _fast_forward(self):
+        current_epoch = self.diagnostics.current_epoch
+        num_batches_to_iter = self.diagnostics.current_epoch_stats.total_batches
+
+        # Set the right epoch
+        self.set_epoch(current_epoch)
+        # Reset diagnostics for this epoch as we're about to re-iterate
+        self.diagnostics.stats_per_epoch[current_epoch] = EpochDiagnostics(
+            epoch=current_epoch
+        )
+
+        self._just_restored_state = False
+        iter(self)
+        for _ in range(num_batches_to_iter):
+            next(self)
+        self._just_restored_state = True
+
     def __iter__(self) -> "DynamicBucketingSampler":
+        if self._just_restored_state:
+            return self
         self.rng = random.Random(self.seed + self.epoch)
+        # Why reset the current epoch?
+        # Either we are iterating the epoch for the first time and it's a no-op,
+        # or we are iterating the same epoch again, in which case setting more steps
+        # than are actually available per epoch would have broken the checkpoint restoration.
+        self.diagnostics.reset_current_epoch()
         # Initiate iteration
         self.cuts_iter = [iter(cs) for cs in self.cuts]
         # Optionally shuffle
@@ -155,17 +224,22 @@ class DynamicBucketingSampler(CutSampler):
                 for cs in self.cuts_iter
             ]
         # Apply filter predicate
-        self.cuts_iter = filter(
-            lambda tpl: all(self._filter_fn(c) for c in tpl), zip(*self.cuts_iter)
+        self.cuts_iter = Filter(
+            iterator=zip(*self.cuts_iter),
+            predicate=lambda tpl: all(self._filter_fn(c) for c in tpl),
+            diagnostics=self.diagnostics,
         )
         # Convert Iterable[Cut] -> Iterable[CutSet]
         self.cuts_iter = DynamicBucketer(
             self.cuts_iter,
             duration_bins=self.duration_bins,
             max_duration=self.max_duration,
+            max_cuts=self.max_cuts,
             drop_last=self.drop_last,
             buffer_size=self.buffer_size,
+            quadratic_duration=self.quadratic_duration,
             rng=self.rng,
+            diagnostics=self.diagnostics,
         )
         self.cuts_iter = iter(self.cuts_iter)
         return self
@@ -213,9 +287,9 @@ def estimate_duration_buckets(cuts: Iterable[Cut], num_buckets: int) -> List[Sec
 
     durs = np.array([c.duration for c in cuts])
     durs.sort()
-    assert num_buckets < durs.shape[0], (
-        f"The number of buckets ({num_buckets}) must be smaller "
-        f"than the number of cuts ({durs.shape[0]})."
+    assert num_buckets <= durs.shape[0], (
+        f"The number of buckets ({num_buckets}) must be smaller than "
+        f"or equal to the number of cuts ({durs.shape[0]})."
     )
     bucket_duration = durs.sum() / num_buckets
 
@@ -236,15 +310,21 @@ class DynamicBucketer:
         cuts: Iterable[Union[Cut, Tuple[Cut]]],
         duration_bins: List[Seconds],
         max_duration: float,
+        max_cuts: Optional[int] = None,
         drop_last: bool = False,
         buffer_size: int = 10000,
+        quadratic_duration: Optional[Seconds] = None,
         rng: random.Random = None,
+        diagnostics: Optional[SamplingDiagnostics] = None,
     ) -> None:
         self.cuts = cuts
         self.duration_bins = duration_bins
         self.max_duration = max_duration
+        self.max_cuts = max_cuts
         self.drop_last = drop_last
         self.buffer_size = buffer_size
+        self.quadratic_duration = quadratic_duration
+        self.diagnostics = ifnone(diagnostics, SamplingDiagnostics())
         if rng is None:
             rng = random.Random()
         self.rng = rng
@@ -276,14 +356,16 @@ class DynamicBucketer:
 
         # Init: determine which buckets are "ready"
         def is_ready(bucket: Deque[Cut]):
-            tot = TimeConstraint(max_duration=self.max_duration)
+            tot = TimeConstraint(
+                max_duration=self.max_duration,
+                max_cuts=self.max_cuts,
+                quadratic_duration=self.quadratic_duration,
+            )
             for c in bucket:
                 tot.add(c[0] if isinstance(c, tuple) else c)
                 if tot.close_to_exceeding():
                     return True
             return False
-
-        assert any(is_ready(bucket) for bucket in self.buckets)
 
         # The iteration code starts here.
         # On each step we're sampling a new batch.
@@ -304,7 +386,11 @@ class DynamicBucketer:
                 sampling_bucket = self.rng.choice(ready_buckets)
                 # Sample one batch from that bucket and yield it to the caller.
                 batcher = DurationBatcher(
-                    sampling_bucket, max_duration=self.max_duration
+                    sampling_bucket,
+                    max_duration=self.max_duration,
+                    max_cuts=self.max_cuts,
+                    quadratic_duration=self.quadratic_duration,
+                    diagnostics=self.diagnostics,
                 )
                 batch = next(iter(batcher))
                 if isinstance(batch, tuple):

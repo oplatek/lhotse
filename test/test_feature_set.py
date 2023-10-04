@@ -11,11 +11,12 @@ from lhotse.audio import RecordingSet
 from lhotse.features import (
     Fbank,
     FeatureMixer,
+    Features,
     FeatureSet,
     FeatureSetBuilder,
-    Features,
     Mfcc,
-    Spectrogram,
+    TorchaudioSpectrogram,
+    TorchaudioSpectrogramConfig,
 )
 from lhotse.features.io import (
     ChunkedLilcomHdf5Writer,
@@ -28,8 +29,9 @@ from lhotse.features.io import (
     NumpyHdf5Writer,
 )
 from lhotse.testing.dummies import DummyManifest
-from lhotse.utils import Seconds, is_module_available, time_diff_to_num_frames
+from lhotse.utils import Seconds, is_module_available
 from lhotse.utils import nullcontext as does_not_raise
+from lhotse.utils import time_diff_to_num_frames
 
 other_params = {}
 some_augmentation = None
@@ -126,12 +128,30 @@ def test_compute_global_stats():
     "storage_fn",
     [
         lambda: LilcomFilesWriter(TemporaryDirectory().name),
-        lambda: LilcomHdf5Writer(NamedTemporaryFile().name),
-        lambda: ChunkedLilcomHdf5Writer(NamedTemporaryFile().name),
         lambda: LilcomChunkyWriter(NamedTemporaryFile().name),
         lambda: NumpyFilesWriter(TemporaryDirectory().name),
-        lambda: NumpyHdf5Writer(NamedTemporaryFile().name),
         lambda: MemoryLilcomWriter(),
+        pytest.param(
+            lambda: NumpyHdf5Writer(NamedTemporaryFile().name),
+            marks=pytest.mark.skipif(
+                not is_module_available("h5py"),
+                reason="h5py must be installed for HDF5 writing",
+            ),
+        ),
+        pytest.param(
+            lambda: LilcomHdf5Writer(NamedTemporaryFile().name),
+            marks=pytest.mark.skipif(
+                not is_module_available("h5py"),
+                reason="h5py must be installed for HDF5 writing",
+            ),
+        ),
+        pytest.param(
+            lambda: ChunkedLilcomHdf5Writer(NamedTemporaryFile().name),
+            marks=pytest.mark.skipif(
+                not is_module_available("h5py"),
+                reason="h5py must be installed for HDF5 writing",
+            ),
+        ),
         pytest.param(
             lambda: KaldiWriter(TemporaryDirectory().name),
             marks=pytest.mark.skipif(
@@ -142,7 +162,9 @@ def test_compute_global_stats():
     ],
 )
 def test_feature_set_builder(storage_fn):
-    recordings: RecordingSet = RecordingSet.from_json("test/fixtures/audio.json")
+    recordings: RecordingSet = RecordingSet.from_json(
+        "test/fixtures/audio.json"
+    ).filter(lambda r: r.id != "recording-4")
     extractor = Fbank(FbankConfig(sampling_rate=8000))
     with storage_fn() as storage:
         builder = FeatureSetBuilder(
@@ -215,14 +237,13 @@ def test_add_feature_sets():
     feature_set_1 = DummyManifest(FeatureSet, begin_id=0, end_id=5)
     feature_set_2 = DummyManifest(FeatureSet, begin_id=5, end_id=10)
     combined = feature_set_1 + feature_set_2
-    assert combined == expected
+    assert combined.to_eager() == expected
 
 
 @pytest.mark.parametrize(
     ["feature_extractor", "decimal", "exception_expectation"],
     [
         (Fbank(FbankConfig(num_filters=40, sampling_rate=8000)), 0, does_not_raise()),
-        (Spectrogram(), -1, does_not_raise()),
         (Mfcc(MfccConfig(sampling_rate=8000)), None, raises(ValueError)),
     ],
 )

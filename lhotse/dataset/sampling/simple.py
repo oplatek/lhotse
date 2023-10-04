@@ -4,7 +4,6 @@ from typing import Any, Dict, Optional
 from lhotse import CutSet, Seconds
 from lhotse.dataset.sampling.base import CutSampler, TimeConstraint
 from lhotse.dataset.sampling.data_source import DataSource
-from lhotse.utils import is_none_or_gt
 
 
 class SimpleCutSampler(CutSampler):
@@ -31,8 +30,6 @@ class SimpleCutSampler(CutSampler):
     def __init__(
         self,
         cuts: CutSet,
-        max_frames: int = None,
-        max_samples: int = None,
         max_duration: Seconds = None,
         max_cuts: Optional[int] = None,
         shuffle: bool = False,
@@ -45,8 +42,6 @@ class SimpleCutSampler(CutSampler):
         SimpleCutSampler's constructor.
 
         :param cuts: the ``CutSet`` to sample data from.
-        :param max_frames: The maximum total number of feature frames from ``cuts``.
-        :param max_samples: The maximum total number of audio samples from ``cuts``.
         :param max_duration: The maximum total recording duration from ``cuts``.
         :param max_cuts: The maximum number of cuts sampled to form a mini-batch.
             By default, this constraint is off.
@@ -60,22 +55,20 @@ class SimpleCutSampler(CutSampler):
         :param seed: Random seed used to consistently shuffle the dataset across different processes.
         """
         super().__init__(
+            drop_last=drop_last,
             shuffle=shuffle,
             world_size=world_size,
             rank=rank,
             seed=seed,
         )
+        assert any(
+            v is not None for v in (max_duration, max_cuts)
+        ), "At least one of max_duration or max_cuts has to be set."
         self.data_source = DataSource(cuts)
         self.time_constraint = TimeConstraint(
-            max_duration=max_duration, max_frames=max_frames, max_samples=max_samples
+            max_duration=max_duration,
+            max_cuts=max_cuts,
         )
-        self.drop_last = drop_last
-        self.max_cuts = max_cuts
-        assert self.time_constraint.is_active() or not (
-            self.time_constraint.is_active() and self.max_cuts is not None
-        )
-        # Constraints
-        assert is_none_or_gt(self.max_cuts, 0)
 
     @property
     def remaining_duration(self) -> Optional[float]:
@@ -112,9 +105,7 @@ class SimpleCutSampler(CutSampler):
         state_dict = super().state_dict()
         state_dict.update(
             {
-                "drop_last": self.drop_last,
                 "time_constraint": self.time_constraint.state_dict(),
-                "max_cuts": self.max_cuts,
             }
         )
         return state_dict
@@ -137,8 +128,6 @@ class SimpleCutSampler(CutSampler):
             For implementers of sub-classes of CutSampler: the flag ``self._just_restored_state`` has to be
             handled in ``__iter__`` to make it avoid resetting the just-restored state (only once).
         """
-        self.drop_last = state_dict.pop("drop_last")
-
         time_constraint = TimeConstraint(**state_dict.pop("time_constraint"))
         if self.time_constraint != time_constraint:
             warnings.warn(
@@ -149,22 +138,12 @@ class SimpleCutSampler(CutSampler):
             )
         self.time_constraint = time_constraint
 
-        max_cuts = state_dict.pop("max_cuts")
-        if self.max_cuts != max_cuts:
-            warnings.warn(
-                "SimpleCutSampler.load_state_dict(): Inconsistent max_cuts:\n"
-                f"expected {self.max_cuts}\n"
-                f"received {max_cuts}\n"
-                f"We will overwrite the settings with the received state_dict."
-            )
-        self.max_cuts = max_cuts
-
         super().load_state_dict(state_dict)
 
         # Restore the data source's state
         if self.shuffle:
             self.data_source.shuffle(self.seed + self.epoch)
-        self.data_source.fast_forward(self.diagnostics.total_cuts)
+        self.data_source.fast_forward(self.diagnostics.current_epoch_stats.total_cuts)
 
     def __iter__(self) -> "SimpleCutSampler":
         """
@@ -173,11 +152,15 @@ class SimpleCutSampler(CutSampler):
         # Restored state with load_state_dict()? Skip resetting only this once.
         if self._just_restored_state:
             return self
+        # Why reset the current epoch?
+        # Either we are iterating the epoch for the first time and it's a no-op,
+        # or we are iterating the same epoch again, in which case setting more steps
+        # than are actually available per epoch would have broken the checkpoint restoration.
+        self.diagnostics.reset_current_epoch()
         # Reset the state to the beginning of the epoch.
         if self.shuffle:
             self.data_source.shuffle(self.seed + self.epoch)
         iter(self.data_source)
-        self.diagnostics.reset()
         return self
 
     def _next_batch(self) -> CutSet:
@@ -201,7 +184,6 @@ class SimpleCutSampler(CutSampler):
                     not self.drop_last or self.time_constraint.close_to_exceeding()
                 ):
                     # We have a partial batch and we can return it.
-                    self.diagnostics.keep(cuts)
                     return CutSet.from_cuts(cuts)
                 else:
                     # There is nothing more to return or it's discarded:
@@ -217,12 +199,9 @@ class SimpleCutSampler(CutSampler):
 
             # Track the duration/frames/etc. constraints.
             self.time_constraint.add(next_cut)
-            next_num_cuts = len(cuts) + 1
 
             # Did we exceed the max_frames and max_cuts constraints?
-            if not self.time_constraint.exceeded() and (
-                self.max_cuts is None or next_num_cuts <= self.max_cuts
-            ):
+            if not self.time_constraint.exceeded():
                 # No - add the next cut to the batch, and keep trying.
                 cuts.append(next_cut)
             else:
@@ -242,16 +221,4 @@ class SimpleCutSampler(CutSampler):
                     )
                     cuts.append(next_cut)
 
-        self.diagnostics.keep(cuts)
         return CutSet.from_cuts(cuts)
-
-
-class SingleCutSampler(SimpleCutSampler):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        warnings.warn(
-            "SingleCutSampler was renamed to SimpleCutSampler in Lhotse v1.0 to avoid confusion "
-            "(the previous name suggested it sampled a single cut rather than a batch of cuts). "
-            "The alias 'SingleCutSampler' is deprecated and will be removed in Lhotse v1.1",
-            category=DeprecationWarning,
-        )

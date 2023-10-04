@@ -41,6 +41,7 @@
 #             ./osssssssssssssssssssssssssssssssssssssssssssssssssssssssssss/-`
 #                 .-:://++++++++++++++++++++++++++++++++++++++++++++///:-.`
 import os
+import sys
 from pathlib import Path
 from subprocess import DEVNULL, PIPE, run
 
@@ -51,10 +52,26 @@ project_root = Path(__file__).parent
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! #
 # NOTE: REMEMBER TO UPDATE THE FALLBACK VERSION IN lhotse/__init__.py WHEN RELEASING #
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! #
-MAJOR_VERSION = 1
-MINOR_VERSION = 0
-PATCH_VERSION = 0
-IS_DEV_VERSION = True  # False = public release, True = otherwise
+VERSION = open(project_root / "VERSION").read().strip()
+IS_DEV_VERSION = not bool(
+    os.environ.get("LHOTSE_PREPARING_RELEASE", False)
+)  # False = public release, True = otherwise
+
+
+if sys.version_info < (3,):
+    # fmt: off
+    print(
+        "Python 2 has reached end-of-life and is no longer supported by lhotse."
+    )
+    # fmt: on
+    sys.exit(-1)
+
+if sys.version_info < (3, 7):
+    print(
+        "Python 3.6 has reached end-of-life on December 31st, 2021 "
+        "and is no longer supported by lhotse."
+    )
+    sys.exit(-1)
 
 
 def discover_lhotse_version() -> str:
@@ -70,7 +87,7 @@ def discover_lhotse_version() -> str:
     from there later. If it's not detected, the version will be 0.0.0.dev.
     """
 
-    version = f"{MAJOR_VERSION}.{MINOR_VERSION}.{PATCH_VERSION}"
+    version = VERSION
     if not IS_DEV_VERSION:
         # This is a PyPI public release -- return a clean version string.
         return version
@@ -129,14 +146,20 @@ install_requires = [
     "click>=7.1.1",
     "cytoolz>=0.10.1",
     "dataclasses",
-    "h5py>=2.10.0",
     "intervaltree>= 3.1.0",
-    "lilcom>=1.1.0",
     "numpy>=1.18.1",
     "packaging",
     "pyyaml>=5.3.1",
+    "tabulate>=0.8.1",
     "tqdm",
 ]
+
+# Workaround for lilcom cmake issue: https://github.com/danpovey/lilcom/issues/41
+# present in automatic documentation builds.
+if os.environ.get("READTHEDOCS", False):
+    install_requires.append("lilcom==1.1.0")
+else:
+    install_requires.append("lilcom>=1.1.0")
 
 try:
     # If the user already installed PyTorch, make sure he has torchaudio too.
@@ -158,17 +181,33 @@ except ImportError:
 
 docs_require = (project_root / "docs" / "requirements.txt").read_text().splitlines()
 tests_require = [
-    "pytest==5.4.3",
-    "flake8==3.8.3",
-    "coverage==5.1",
-    "hypothesis==5.41.2",
-    "black==21.10b0",
+    "pytest==7.1.3",
+    "pytest-forked==1.4.0",
+    "pytest-xdist==2.5.0",
+    "pytest-cov==4.0.0",
+    "flake8==5.0.4",
+    "coverage==6.5.0",
+    "hypothesis==6.56.0",
+    "black==22.3.0",
+    "isort==5.10.1",
+    "pre-commit>=2.17.0,<=2.19.0",
 ]
+orjson_requires = ["orjson>=3.6.6"]
+webdataset_requires = ["webdataset==0.2.5"]
+dill_requires = ["dill"]
+h5py_requires = ["h5py"]
+kaldi_requires = ["kaldi_native_io", "kaldifeat"]
+workflow_requires = ["scipy"]
 dev_requires = sorted(
-    docs_require + tests_require + ["jupyterlab", "matplotlib", "isort"]
+    docs_require
+    + tests_require
+    + orjson_requires
+    + webdataset_requires
+    + dill_requires
+    + workflow_requires
+    + ["jupyterlab", "matplotlib"]
 )
-orjson_require = ["orjson>=3.6.6"]
-all_requires = sorted(dev_requires + orjson_require)
+all_requires = sorted(dev_requires)
 
 if os.environ.get("READTHEDOCS", False):
     # When building documentation, omit torchaudio installation and mock it instead.
@@ -183,7 +222,7 @@ if os.environ.get("READTHEDOCS", False):
 setup(
     name="lhotse",
     version=LHOTSE_VERSION,
-    python_requires=">=3.6.0",
+    python_requires=">=3.7.0",
     description="Data preparation for speech processing models training.",
     author="The Lhotse Development Team",
     author_email="pzelasko@jhu.edu",
@@ -199,21 +238,27 @@ setup(
     },
     install_requires=install_requires,
     extras_require={
-        "orjson": orjson_require,
+        "dill": dill_requires,
+        "orjson": orjson_requires,
+        "webdataset": webdataset_requires,
+        "h5py": h5py_requires,
+        "kaldi": kaldi_requires,
         "docs": docs_require,
         "tests": tests_require,
         "dev": dev_requires,
         "all": all_requires,
     },
     classifiers=[
-        "Development Status :: 4 - Beta",
-        "Programming Language :: Python :: 3.6",
+        "Development Status :: 5 - Production/Stable",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
         "Intended Audience :: Science/Research",
         "Operating System :: POSIX :: Linux",
         "Operating System :: MacOS :: MacOS X",
+        "Operating System :: Microsoft :: Windows",
         "License :: OSI Approved :: Apache Software License",
         "Topic :: Multimedia :: Sound/Audio :: Speech",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",

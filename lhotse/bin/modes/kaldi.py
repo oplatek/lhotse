@@ -28,8 +28,8 @@ def kaldi():
     "--map-string-to-underscores",
     default=None,
     type=str,
-    help="""When specified, we will replace all instances of this string 
-    in SupervisonSegment IDs to underscores. This is to help with handling 
+    help="""When specified, we will replace all instances of this string
+    in SupervisonSegment IDs to underscores. This is to help with handling
     underscores in Kaldi (see 'export_to_kaldi').""",
 )
 @click.option(
@@ -39,6 +39,23 @@ def kaldi():
     type=int,
     help="Number of jobs for computing recording durations.",
 )
+@click.option(
+    "-t",
+    "--feature-type",
+    default="kaldi-fbank",
+    show_default=True,
+    type=click.Choice(["kaldi-fbank", "kaldi-mfcc"]),
+    help="Feature type when importing precomputed features from feats.scp",
+)
+@click.option(
+    "-d",
+    "--compute-durations",
+    default=False,
+    is_flag=True,
+    show_default=True,
+    type=bool,
+    help="Compute durations by reading the whole file instead of using reco2dur file",
+)
 def import_(
     data_dir: Pathlike,
     sampling_rate: int,
@@ -46,11 +63,14 @@ def import_(
     frame_shift: float,
     map_string_to_underscores: Optional[str],
     num_jobs: int,
+    feature_type: str,
+    compute_durations: bool,
 ):
     """
     Convert a Kaldi data dir DATA_DIR into a directory MANIFEST_DIR of lhotse manifests. Ignores feats.scp.
     The SAMPLING_RATE has to be explicitly specified as it is not available to read from DATA_DIR.
     """
+    from lhotse import CutSet
     from lhotse.kaldi import load_kaldi_data_dir
 
     recording_set, maybe_supervision_set, maybe_feature_set = load_kaldi_data_dir(
@@ -59,6 +79,8 @@ def import_(
         frame_shift=frame_shift,
         map_string_to_underscores=map_string_to_underscores,
         num_jobs=num_jobs,
+        use_reco2dur=not compute_durations,
+        feature_type=feature_type,
     )
     manifest_dir = Path(manifest_dir)
     manifest_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +89,12 @@ def import_(
         maybe_supervision_set.to_file(manifest_dir / "supervisions.jsonl.gz")
     if maybe_feature_set is not None:
         maybe_feature_set.to_file(manifest_dir / "features.jsonl.gz")
+    CutSet.from_manifests(
+        recordings=recording_set,
+        supervisions=maybe_supervision_set,
+        features=maybe_feature_set,
+        tolerance=0.1,
+    ).to_file(manifest_dir / "cuts.jsonl.gz")
 
 
 @kaldi.command()
@@ -102,13 +130,13 @@ def export(
     """
     Convert a pair of ``RecordingSet`` and ``SupervisionSet`` manifests into a Kaldi-style data directory.
     """
-    from lhotse import load_manifest
     from lhotse.kaldi import export_to_kaldi
+    from lhotse.serialization import load_manifest_lazy_or_eager
 
     output_dir = Path(output_dir)
     export_to_kaldi(
-        recordings=load_manifest(recordings),
-        supervisions=load_manifest(supervisions),
+        recordings=load_manifest_lazy_or_eager(recordings),
+        supervisions=load_manifest_lazy_or_eager(supervisions),
         output_dir=output_dir,
         map_underscores_to=map_underscores_to,
         prefix_spk_id=prefix_spk_id,

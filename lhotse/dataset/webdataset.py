@@ -1,11 +1,64 @@
+"""
+High-level architecture of the Lhotse+WebDataset solution.
+Read the documentation of the items below to understand each component better.
+
+┌────────────────────────────────────────────────────────────────────────┐
+│┌──────────────────────────────────────────────────────────────────────┐│
+││                            Training loop                             ││
+│└──────────────────────────────────────────────────────────────────────┘│
+│                                    │                                   │
+│                                    ▼                                   │
+│                     ┌─────────────────────────────┐                    │
+│                     │ torch.utils.data.DataLoader │                    │
+│                     └─────────────────────────────┘        Main process│
+└────────────────────────────────────┬───────────────────────────────────┘
+       ┌─────────────────────────────┼───────────────────────────────┐
+       ▼       ┌─────────────────────▼───────────────────────┐       ▼
+  ┌─────────┐  │                ┌─────────┐   Sub-process #i │  ┌─────────┐
+  │Worker #1│  │                │Worker #i│                  │  │Worker #N│
+  └─────────┘  │                └─────────┘                  │  └─────────┘
+               │                     │                       │
+               │                     ▼                       │
+               │        ┌────────────────────────┐           │
+               │        │ IterableDatasetWrapper │           │
+               │        └────────────────────────┘           │
+               │                     │                       │
+               │           ┌─────────┴──────┐                │
+               │           ▼                ▼                │
+               │  ┌─────────────────┐ ┌───────────┐          │
+               │  │Map-style Dataset│ │  Sampler  │          │
+               │  │ (task-specific) │ │           │          │
+               │  └─────────────────┘ └───────────┘          │
+               │                            │                │
+               │                            ▼                │
+               │                      ┌───────────┐          │
+               │                      │  CutSet   │          │
+               │                      └───────────┘          │
+               │                            │                │
+               │                            ▼                │
+               │               ┌────────────────────────┐    │
+               │               │Lazy WebDataset Iterator│    │
+               │               │(discards shard_idx % N)│    │
+               │               └────────────────────────┘    │
+               │                            │                │
+               │                ┌───────────┼───────────┐    │
+               │                ▼           ▼           ▼    │
+               │           ┌────────┐  ┌────────┐  ┌────────┐│
+               │           │Shard #1│  │Shard #j│  │Shard #M││
+               │           └────────┘  └────────┘  └────────┘│
+               └─────────────────────────────────────────────┘
+"""
+import logging
 import pickle
-from typing import Callable, Dict, Optional, Sequence, Union
+import random
+from functools import partial
+from typing import Callable, Dict, Generator, Iterable, List, Optional, Sequence, Union
 
-from tqdm.auto import tqdm
+import tqdm
 
-from lhotse import CutSet
-from lhotse.serialization import LazyIteratorChain
-from lhotse.utils import Pathlike, is_module_available
+from lhotse import CutSet, MonoCut
+from lhotse.lazy import LazyIteratorChain
+from lhotse.utils import Pathlike, is_module_available, suppress_and_warn
 
 
 def export_to_webdataset(
@@ -17,6 +70,7 @@ def export_to_webdataset(
     load_audio: bool = True,
     load_features: bool = True,
     load_custom: bool = True,
+    fault_tolerant: bool = True,
 ) -> int:
     """
     Saves the CutSet metadata along with audio/features data into a WebDataset archive.
@@ -34,6 +88,9 @@ def export_to_webdataset(
     be internally expanded with the shard index.
 
     Returns number of written shards if sharding is enabled, otherwise 0.
+
+    .. note: By default, we'll skip cuts which failed to load for any reason and proceed
+        with exporting. To raise an exception and stop, set ``fault_tolerant=False``.
 
     **Examples**
 
@@ -80,35 +137,159 @@ def export_to_webdataset(
         ...     shard_size=10000,
         ... )
     """
-    if not is_module_available("webdataset"):
-        raise ImportError("Please 'pip install webdataset' first.")
-    from webdataset import TarWriter
 
-    if shard_size is not None:
-        assert shard_size > 0
-        # Note: this ShardWriter is not from webdataset, but defined below in this file.
-        sink = ShardWriter(output_path, maxcount=shard_size)
-    else:
-        sink = TarWriter(output_path)
+    writer = WebdatasetWriter(
+        path_or_url=output_path,
+        shard_size=shard_size,
+        audio_format=audio_format,
+        load_audio=load_audio,
+        load_features=load_features,
+        load_custom=load_custom,
+        fault_tolerant=fault_tolerant,
+    )
 
-    num_shards_written = 0
-    with sink:
-        for idx, cut in tqdm(
-            enumerate(cuts), desc="Creating WebDataset tarball(s)", disable=not verbose
-        ):
-            cut = cut.move_to_memory(
-                audio_format=audio_format,
-                load_audio=load_audio,
-                load_features=load_features,
-                load_custom=load_custom,
-            )
-            data = pickle.dumps(cut.to_dict())
-            sink.write({"__key__": cut.id, "data": data})
+    total = 0
+    ok = 0
+    with writer, tqdm.auto.tqdm(
+        desc="Creating WebDataset tarball(s)", disable=not verbose
+    ) as pbar:
+        for cut in cuts:
+            total += 1
+            success = writer.write(cut)
+            ok += int(success)
+            pbar.update()
 
-        if isinstance(sink, ShardWriter):
-            num_shards_written = sink.shard
+    num_shards_written = writer.num_shards_written
+
+    logging.info(
+        f"Exported {ok} cuts out of {total} total into {num_shards_written} shards "
+        f"(there were {total - ok} cuts with errors)."
+    )
 
     return num_shards_written
+
+
+class WebdatasetWriter:
+    """
+    Saves the CutSet metadata along with audio/features data into a WebDataset archive.
+    The audio and feature data is read, decoded, and encoded into ``audio_format`` for audio,
+    lilcom for features and arrays with floating point type, and pickle for all other dtypes.
+    The intended use of this function is to speed up the I/O in training data pipelines by
+    converting random access reads to sequential access reads.
+
+    Supported values for ``audio_format`` are the same as for the ``format`` argument in
+    ``torchaudio.save`` function with ``sox_io`` backend.
+
+    If ``shard_size`` is specified, we will leverage WebDataset's ``ShardWriter`` to
+    create multiple tarballs with ``shard_size`` items per shard. In that mode, we expect
+    that ``output_path`` contains a pattern like "/path/to/shard-%06d.tar", which will
+    be internally expanded with the shard index.
+
+    Returns number of written shards if sharding is enabled, otherwise 0.
+
+    .. note: By default, we'll skip cuts which failed to load for any reason and proceed
+        with exporting. To raise an exception and stop, set ``fault_tolerant=False``.
+
+    **Example**
+
+    Export cuts with audio, features, and all custom data to a tarball shards with 500
+    cuts each::
+
+        >>> cuts = CutSet.from_jsonl_lazy("data/cuts-train.jsonl")
+        >>> with WebdatasetWriter("data/tars/shard-%06d.tar", shard_size=500) as writer:
+        ...     for cut in cuts:
+        ...         writer.write(cut)
+        >>> output_paths = writer.output_manifest_paths()
+
+    See also: :func`.export_to_webdataset`
+    """
+
+    def __init__(
+        self,
+        path_or_url: Pathlike,
+        shard_size: Optional[int] = None,
+        audio_format: str = "flac",
+        load_audio: bool = True,
+        load_features: bool = True,
+        load_custom: bool = True,
+        fault_tolerant: bool = True,
+    ) -> None:
+        if not is_module_available("webdataset"):
+            raise ImportError("Please 'pip install webdataset' first.")
+
+        from webdataset import TarWriter
+
+        self.path_or_url = path_or_url
+        self.shard_size = shard_size
+        self.audio_format = audio_format
+        self.load_audio = load_audio
+        self.load_features = load_features
+        self.load_custom = load_custom
+        self.fault_tolerant = fault_tolerant
+
+        if self.shard_size is not None:
+            assert self.shard_size > 0
+            # Note: this ShardWriter is not from webdataset, but defined below in this file.
+            self.writer_init_fn = partial(
+                ShardWriter, self.path_or_url, maxcount=self.shard_size
+            )
+        else:
+            self.writer_init_fn = partial(TarWriter, self.path_or_url)
+
+        self.writer = None
+        self.num_shards_written = None
+        self.finished = None
+
+    def __enter__(self) -> "WebdatasetWriter":
+        self.writer = self.writer_init_fn()
+        self.finished = False
+        return self
+
+    def __exit__(self, *args, **kwargs) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if isinstance(self.writer, ShardWriter):
+            self.num_shards_written = self.writer.shard
+        self.writer.close()
+        self.finished = True
+
+    def write(self, manifest: MonoCut) -> bool:
+        """
+        Converts a Cut to a dict, pickles it, and then stores into a tarfile.
+
+        :param manifest: the manifest to be written.
+        :return: bool indicating whether the writing was successful.
+        """
+        with suppress_and_warn(Exception, enabled=self.fault_tolerant):
+            cut = manifest.move_to_memory(
+                audio_format=self.audio_format,
+                load_audio=self.load_audio,
+                load_features=self.load_features,
+                load_custom=self.load_custom,
+            )
+            data = pickle.dumps(cut.to_dict())
+            self.writer.write({"__key__": cut.id, "data": data})
+            return True
+        # Will get here if an exception happened.
+        return False
+
+    def output_manifest_paths(self) -> List[str]:
+        """
+        Return the a list of paths/urls where the data was written.
+        The list can be used directly to initialize :class:`.LazyWebdatasetIterator`
+        or :meth:`lhotse.cut.CutSet.from_webdataset`.
+        Useful when writing into shards with a specified pattern.
+        """
+        if self.finished is None:
+            raise ValueError("The writer has not written anything yet.")
+        if not self.finished:
+            raise ValueError(
+                "The writer was not closed -- call writer.close() first, or use it as a context manager."
+            )
+        if self.num_shards_written is None:
+            return [self.path_or_url]
+        return [self.path_or_url % i for i in range(self.num_shards_written)]
 
 
 class LazyWebdatasetIterator:
@@ -167,6 +348,7 @@ class LazyWebdatasetIterator:
         data_dict = next(self._ds_iter)
         data = pickle.loads(data_dict["data"])
         item = deserialize_item(data)
+        item.shard_origin = data_dict["__url__"]
         return item
 
     def values(self):
@@ -185,12 +367,9 @@ class LazyWebdatasetIterator:
 def mini_webdataset(
     urls: Union[Pathlike, Sequence[Pathlike]],
     epoch: int = 0,
-    repeat: bool = False,
     shuffle_shards: bool = False,
-    shuffle: bool = False,
-    split_by_worker: bool = False,
+    split_by_worker: bool = True,
     split_by_node: bool = False,
-    shuffle_bufsize: int = 1000,
     ignore_error_shards: bool = True,
 ):
     """
@@ -209,46 +388,66 @@ def mini_webdataset(
         possible to disable the node/worker splitting.
 
     :param urls: the source URLs: a string or a list.
-    :param epoch: epoch number (used only when shuffling is enabled).
-    :param repeat: repeat infinitely if True.
-    :param shuffle: shuffle the items if True (after shuffling the shards, if enabled).
-        Note: ``shuffle`` is seeded with PID and time, making it non-reproducible across processes.
+    :param epoch: epoch number (used only when ``shuffle_shards`` is enabled).
     :param shuffle_shards: shuffle the shards if True.
         Only takes effect when ``urls`` is a list of shard paths/urls.
-    :param split_by_worker: if True, shards are split per DataLoader worker subprocesses,
+    :param split_by_worker: DEPRECATED: always acts as if True.
+        If True, shards are split per DataLoader worker subprocesses,
         otherwise each dataloader worker will yield the same data.
         Only takes effect when ``urls`` is a list of shard paths/urls.
     :param split_by_node: if True, shards are split per node in DDP training,
         otherwise on each node we'll yield the same data.
         Only takes effect when ``urls`` is a list of shard paths/urls.
-    :param shuffle_bufsize: Buffer size for the ``shuffle`` argument.
-        Larger bufsize means more memory usage but potentially improved randomness.
     :param ignore_error_shards: when ``True``, we tell WebDataset to ignore shards that
         failed during loading and emit a warning. When ``False``, we won't catch the exceptions.
     """
     if not is_module_available("webdataset"):
         raise ImportError("Please 'pip install webdataset' first.")
 
-    from webdataset import PytorchShardList, reraise_exception, warn_and_continue
-    from webdataset import tariterators
+    from webdataset import DataPipeline, SimpleShardList, reraise_exception
+    from webdataset import split_by_node as split_by_node_
+    from webdataset import split_by_worker as split_by_worker_
+    from webdataset import tarfile_to_samples, warn_and_continue
 
-    handler = warn_and_continue if ignore_error_shards else reraise_exception
-
-    result = PytorchShardList(
-        urls,
-        shuffle=shuffle_shards,
-        split_by_worker=split_by_worker,
-        split_by_node=split_by_node,
+    wds = DataPipeline(SimpleShardList(urls=urls))
+    if split_by_node:
+        wds.append(split_by_node_)
+    if split_by_worker:
+        wds.append(split_by_worker_)
+    if shuffle_shards:
+        wds.append(create_shard_shuffler(epoch=epoch))
+    wds.append(
+        tarfile_to_samples(
+            handler=warn_and_continue if ignore_error_shards else reraise_exception,
+        )
     )
-    result.set_epoch(epoch)
-    result = result.then(tariterators.url_opener, handler=handler)
-    result = result.then(tariterators.tar_file_expander, handler=handler)
-    result = result.then(tariterators.group_by_keys, handler=handler)
-    if repeat:
-        result = result.repeat()
-    if shuffle:
-        result = result.shuffle(shuffle_bufsize)
-    return result
+    return wds
+
+
+def create_shard_shuffler(epoch: int):
+    from webdataset import PipelineStage
+
+    class detshuffle_all(PipelineStage):
+        def __init__(self, seed_=0, epoch_=-1):
+            self.seed_ = seed_
+            self.epoch_ = epoch_
+
+        def run(self, src):
+            self.epoch_ += 1
+            rng = random.Random()
+            rng.seed(hash((self.seed_, self.epoch_)))
+            items = list(src)
+            rng.shuffle(items)
+            return items
+
+    return detshuffle_all(epoch_=epoch)
+
+
+def _single_node_or_multi_node_with_duplicated_data(src, group=None):
+    """
+    Helper fn that works normally with single-node training, but duplicates data in multi-node training.
+    """
+    yield from src
 
 
 class ShardWriter:
@@ -292,6 +491,9 @@ class ShardWriter:
         self.tarstream = None
         self.shard = start_shard
         self.pattern = pattern
+        assert (
+            self.pattern != "-"
+        ), "Dash '-' is not an allowed pattern for ShardWriter."
         self.total = 0
         self.count = 0
         self.size = 0

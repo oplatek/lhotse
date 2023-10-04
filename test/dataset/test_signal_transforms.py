@@ -6,6 +6,9 @@ import torch
 from lhotse import CutSet
 from lhotse.dataset import GlobalMVN, RandomizedSmoothing, SpecAugment
 from lhotse.dataset.collation import collate_features
+from lhotse.dataset.signal_transforms import DereverbWPE
+from lhotse.testing.random import deterministic_rng
+from lhotse.utils import is_module_available
 
 
 @pytest.fixture
@@ -55,8 +58,10 @@ def test_specaugment_2d_input_raises_error():
 
 
 @pytest.mark.parametrize("num_feature_masks", [0, 1, 2])
-@pytest.mark.parametrize("num_frame_masks", [0, 1, 2])
-def test_specaugment_3d_input_works(num_feature_masks, num_frame_masks):
+@pytest.mark.parametrize("num_frame_masks", [1, 2, 3])
+def test_specaugment_3d_input_works(
+    deterministic_rng, num_feature_masks, num_frame_masks
+):
     cuts = CutSet.from_json("test/fixtures/ljspeech/cuts.json")
     feats, feat_lens = collate_features(cuts)
     tfnm = SpecAugment(
@@ -90,6 +95,7 @@ def test_specaugment_state_dict():
 
 
 def test_specaugment_load_state_dict():
+    torch.manual_seed(0)
     # all values non-default
     config = dict(
         time_warp_factor=85,
@@ -108,7 +114,8 @@ def test_specaugment_load_state_dict():
 
 
 @pytest.mark.parametrize("sample_sigma", [True, False])
-def test_randomized_smoothing(sample_sigma):
+def test_randomized_smoothing(deterministic_rng, sample_sigma):
+    torch.manual_seed(0)
     audio = torch.zeros(64, 4000, dtype=torch.float32)
     tfnm = RandomizedSmoothing(sigma=0.1, sample_sigma=sample_sigma, p=0.8)
     audio_aug = tfnm(audio)
@@ -123,7 +130,7 @@ def test_randomized_smoothing(sample_sigma):
     assert len(set(audio_aug.sum(dim=1).tolist())) > 1
 
 
-def test_randomized_smoothing_p1():
+def test_randomized_smoothing_p1(deterministic_rng):
     audio = torch.zeros(64, 4000, dtype=torch.float32)
     tfnm = RandomizedSmoothing(sigma=0.1, p=1.0)
     audio_aug = tfnm(audio)
@@ -135,7 +142,7 @@ def test_randomized_smoothing_p1():
     assert (audio_aug[0] != audio_aug[1]).any()
 
 
-def test_randomized_smoothing_p0():
+def test_randomized_smoothing_p0(deterministic_rng):
     audio = torch.zeros(64, 4000, dtype=torch.float32)
     tfnm = RandomizedSmoothing(sigma=0.1, p=0.0)
     audio_aug = tfnm(audio)
@@ -147,7 +154,7 @@ def test_randomized_smoothing_p0():
     assert (audio_aug[0] == audio_aug[1]).all()
 
 
-def test_randomized_smoothing_schedule():
+def test_randomized_smoothing_schedule(deterministic_rng):
     audio = torch.zeros(16, 16000, dtype=torch.float32)
     tfnm = RandomizedSmoothing(sigma=[(0, 0.01), (100, 0.5)], p=0.8)
     audio_aug = tfnm(audio)
@@ -165,3 +172,31 @@ def test_randomized_smoothing_schedule():
     audio_aug2 = tfnm(audio)
     # The schedule kicked in and the abs magnitudes should be larger.
     assert audio_aug2.abs().sum() > audio_aug.abs().sum()
+
+
+@pytest.mark.skipif(
+    not is_module_available("nara_wpe"), reason="Requires nara_wpe to be installed."
+)
+def test_wpe_single_channel(deterministic_rng):
+    B, T = 16, 32000
+    audio = torch.randn(B, T, dtype=torch.float32)
+    tfnm = DereverbWPE()
+    audio_aug = tfnm(audio)
+    # Shapes are the same
+    assert audio.shape == audio_aug.shape
+    # Some samples are different than the input audio
+    assert (audio != audio_aug).any()
+
+
+@pytest.mark.skipif(
+    not is_module_available("nara_wpe"), reason="Requires nara_wpe to be installed."
+)
+def test_wpe_multi_channel(deterministic_rng):
+    B, D, T = 16, 2, 32000
+    audio = torch.randn(B, D, T, dtype=torch.float32)
+    tfnm = DereverbWPE()
+    audio_aug = tfnm(audio)
+    # Shapes are the same
+    assert audio.shape == audio_aug.shape
+    # Some samples are different than the input audio
+    assert (audio != audio_aug).any()

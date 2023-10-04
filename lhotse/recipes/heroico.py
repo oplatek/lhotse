@@ -5,10 +5,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, NamedTuple, Optional, Union
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import AudioSource, Recording, RecordingSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress
+from lhotse.utils import Pathlike, resumable_download, safe_extract
 
 # files containing transcripts
 heroico_dataset_answers = "heroico-answers.txt"
@@ -22,7 +22,7 @@ def download_heroico(
     target_dir: Pathlike = ".",
     force_download: Optional[bool] = False,
     url: Optional[str] = "http://www.openslr.org/resources/39",
-) -> None:
+) -> Path:
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     tar_name = f"LDC2006S37.tar.gz"
@@ -30,14 +30,15 @@ def download_heroico(
     completed_detector = target_dir / ".completed"
     if completed_detector.is_file():
         logging.info(f"Skipping {tar_name} because {completed_detector} exists.")
-        return
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(
-            f"{url}/{tar_name}", filename=tar_path, desc="Downloading Heroico"
-        )
+        return target_dir
+    resumable_download(
+        f"{url}/{tar_name}", filename=tar_path, force_download=force_download
+    )
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=target_dir)
+        safe_extract(tar, path=target_dir)
     completed_detector.touch()
+
+    return target_dir
 
 
 class HeroicoMetaData(NamedTuple):
@@ -61,12 +62,12 @@ def prepare_heroico(
     output_dir: Optional[Pathlike] = None,
 ) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
     """
-        Returns the manifests which consist of the Recordings and Supervisions
+    Returns the manifests which consist of the Recordings and Supervisions
 
-        :param speech_dir: Pathlike, the path of the speech data dir.
-    param transcripts_dir: Pathlike, the path of the transcript data dir.
-        :param output_dir: Pathlike, the path where to write the manifests.
-        :return: a Dict whose key is the fold, and the value is Dicts with the keys 'audio' and 'supervisions'.
+    :param speech_dir: Pathlike, the path of the speech data dir.
+    :param transcripts_dir: Pathlike, the path of the transcript data dir.
+    :param output_dir: Pathlike, the path where to write the manifests.
+    :return: a Dict whose key is the fold, and the value is Dicts with the keys 'audio' and 'supervisions'.
     """
     import soundfile
 
@@ -80,21 +81,21 @@ def prepare_heroico(
     manifests = defaultdict(dict)
 
     # set some patterns to match fields in transcript files and filenames
-    answers_line_pattern = re.compile("\d+/\d+\t.+")
+    answers_line_pattern = re.compile(r"\d+/\d+\t.+")
     answers_path_pattern = re.compile("Answers_Spanish")
-    heroico_recitations_line_pattern = re.compile("\d+\t.+")
+    heroico_recitations_line_pattern = re.compile(r"\d+\t.+")
     heroico_recitations_devtest_path_pattern = re.compile("Recordings_Spanish")
     heroico_recitations_train_path_pattern = re.compile("Recordings_Spanish")
-    usma_line_pattern = re.compile("s\d+\t.+")
+    usma_line_pattern = re.compile(r"s\d+\t.+")
     usma_native_demo_pattern = re.compile(
-        "usma/native\-[fm]\-\w+\-\S+\-\S+\-\S+\-\S+\-\w+\d+"
+        r"usma/native\-[fm]\-\w+\-\S+\-\S+\-\S+\-\S+\-\w+\d+"
     )
     usma_native_path_pattern = re.compile("usma/native")
-    usma_native_prompt_id_pattern = re.compile("s\d+")
+    usma_native_prompt_id_pattern = re.compile(r"s\d+")
     usma_nonnative_demo_pattern = re.compile(
-        "nonnative\-[fm]\-[a-zA-Z]+\d*\-[a-zA-Z]+\-[a-zA-Z]+\-[a-zA-Z]+\-[a-zA-Z]+\-[a-zA-Z]+\d+"
+        r"nonnative\-[fm]\-[a-zA-Z]+\d*\-[a-zA-Z]+\-[a-zA-Z]+\-[a-zA-Z]+\-[a-zA-Z]+\-[a-zA-Z]+\d+"
     )
-    usma_nonnative_path_pattern = re.compile("nonnative.+\.wav")
+    usma_nonnative_path_pattern = re.compile(r"nonnative.+\.wav")
 
     # Generate a mapping: utt_id -> (audio_path, audio_info, text)
 
@@ -276,11 +277,12 @@ def prepare_heroico(
             for idx in audio.recordings
         )
 
+        audio, supervision = fix_manifests(audio, supervision)
         validate_recordings_and_supervisions(audio, supervision)
 
         if output_dir is not None:
-            supervision.to_json(output_dir / f"supervisions_{fld}.json")
-            audio.to_json(output_dir / f"recordings_{fld}.json")
+            supervision.to_file(output_dir / f"heroico_supervisions_{fld}.jsonl.gz")
+            audio.to_file(output_dir / f"heroico_recordings_{fld}.jsonl.gz")
 
         manifests[fld] = {"recordings": audio, "supervisions": supervision}
 

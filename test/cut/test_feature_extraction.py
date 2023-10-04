@@ -8,25 +8,28 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import lhotse
 from lhotse import (
+    S3PRLSSL,
+    AudioSource,
     CutSet,
     Fbank,
     FbankConfig,
-    TorchaudioFbank,
-    TorchaudioMfcc,
     KaldifeatFbank,
     KaldifeatMfcc,
     LibrosaFbank,
     LibrosaFbankConfig,
-    LilcomHdf5Writer,
+    LilcomChunkyWriter,
+    LogSpectrogram,
     Mfcc,
     MonoCut,
     Recording,
+    Spectrogram,
+    SupervisionSegment,
+    TorchaudioFbank,
+    TorchaudioMfcc,
     load_manifest,
     validate,
 )
-from lhotse.audio import AudioSource
 from lhotse.cut import MixedCut
 from lhotse.features.io import LilcomFilesWriter
 from lhotse.serialization import InvalidPathExtension
@@ -49,7 +52,18 @@ def recording():
 
 @pytest.fixture
 def cut(recording):
-    return MonoCut(id="cut", start=0, duration=1.0, channel=0, recording=recording)
+    return MonoCut(
+        id="cut",
+        start=0,
+        duration=1.0,
+        channel=0,
+        recording=recording,
+        supervisions=[
+            SupervisionSegment(
+                id="sup", recording_id=recording.id, start=0, duration=0.5
+            )
+        ],
+    )
 
 
 def test_extract_features(cut):
@@ -78,6 +92,7 @@ def test_extract_and_store_features_from_mixed_cut(cut, mix_eagerly):
         cut_with_feats = mixed_cut.compute_and_store_features(
             extractor=extractor, storage=storage, mix_eagerly=mix_eagerly
         )
+        validate(cut_with_feats)
         arr = cut_with_feats.load_features()
     assert arr.shape[0] == 200
     assert arr.shape[1] == extractor.feature_dim(mixed_cut.sampling_rate)
@@ -111,7 +126,7 @@ def is_dask_availabe():
 
 
 @pytest.mark.parametrize("mix_eagerly", [False, True])
-@pytest.mark.parametrize("storage_type", [LilcomFilesWriter, LilcomHdf5Writer])
+@pytest.mark.parametrize("storage_type", [LilcomFilesWriter, LilcomChunkyWriter])
 @pytest.mark.parametrize(
     ["executor", "num_jobs"],
     [
@@ -171,11 +186,19 @@ def test_extract_and_store_features_from_cut_set(
         assert arr.shape[1] == extractor.feature_dim(cuts[0].sampling_rate)
 
 
+def is_python_311_or_higher() -> bool:
+    import sys
+
+    return sys.version_info[:2] > (3, 10)
+
+
 @pytest.mark.parametrize(
     "extractor_type",
     [
         Fbank,
         Mfcc,
+        Spectrogram,
+        LogSpectrogram,
         TorchaudioFbank,
         TorchaudioMfcc,
         pytest.param(
@@ -201,6 +224,15 @@ def test_extract_and_store_features_from_cut_set(
                 ),
             ],
         ),
+        pytest.param(
+            S3PRLSSL,
+            marks=[
+                pytest.mark.skipif(
+                    not is_module_available("s3prl") or is_python_311_or_higher(),
+                    reason="Requires s3prl to run.",
+                ),
+            ],
+        ),
     ],
 )
 def test_cut_set_batch_feature_extraction(cut_set, extractor_type):
@@ -211,6 +243,42 @@ def test_cut_set_batch_feature_extraction(cut_set, extractor_type):
             extractor=extractor,
             storage_path=tmpf.name,
             num_workers=0,
+        )
+        validate(cut_set_with_feats, read_data=True)
+
+
+@pytest.mark.parametrize(
+    "extractor_type",
+    [
+        Fbank,
+        TorchaudioFbank,
+        pytest.param(
+            KaldifeatFbank,
+            marks=pytest.mark.skipif(
+                not is_module_available("kaldifeat"),
+                reason="Requires kaldifeat to run.",
+            ),
+        ),
+        pytest.param(
+            S3PRLSSL,
+            marks=[
+                pytest.mark.skipif(
+                    not is_module_available("s3prl") or is_python_311_or_higher(),
+                    reason="Requires s3prl to run.",
+                ),
+            ],
+        ),
+    ],
+)
+def test_cut_set_batch_feature_extraction_with_collation(cut_set, extractor_type):
+    extractor = extractor_type()
+    cut_set = cut_set.resample(16000)
+    with NamedTemporaryFile() as tmpf:
+        cut_set_with_feats = cut_set.compute_and_store_features_batch(
+            extractor=extractor,
+            storage_path=tmpf.name,
+            num_workers=0,
+            collate=True,
         )
         validate(cut_set_with_feats, read_data=True)
 
@@ -314,3 +382,20 @@ def test_on_the_fly_batch_feature_extraction(cut_set, extractor_type):
     feats, feat_lens = extractor(cut_set)  # does not crash
     assert isinstance(feats, torch.Tensor)
     assert isinstance(feat_lens, torch.Tensor)
+
+
+def test_on_the_fly_feats_return_audio(cut_set):
+    from lhotse.dataset import OnTheFlyFeatures
+
+    extractor = OnTheFlyFeatures(extractor=Fbank(), return_audio=True)
+    cut_set = cut_set.resample(16000)
+    feats, feat_lens, audios, audio_lens = extractor(cut_set)
+    assert isinstance(feats, torch.Tensor)
+    assert isinstance(feat_lens, torch.Tensor)
+    assert isinstance(audios, torch.Tensor)
+    assert isinstance(audio_lens, torch.Tensor)
+
+    assert feats.shape == (2, 300, 80)
+    assert feat_lens.shape == (2,)
+    assert audios.shape == (2, 48000)
+    assert audio_lens.shape == (2,)

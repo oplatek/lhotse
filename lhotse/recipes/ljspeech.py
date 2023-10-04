@@ -16,17 +16,17 @@ import tarfile
 from pathlib import Path
 from typing import Dict, Optional, Union
 
-from lhotse import validate_recordings_and_supervisions
+from lhotse import fix_manifests, validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.features import Fbank
 from lhotse.features.base import TorchaudioFeatureExtractor
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, fastcopy, urlretrieve_progress
+from lhotse.utils import Pathlike, fastcopy, resumable_download, safe_extract
 
 
 def download_ljspeech(
     target_dir: Pathlike = ".", force_download: Optional[bool] = False
-) -> None:
+) -> Path:
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
     dataset_name = "LJSpeech-1.1"
@@ -35,17 +35,18 @@ def download_ljspeech(
     completed_detector = corpus_dir / ".completed"
     if completed_detector.is_file():
         logging.info(f"Skipping {dataset_name} because {completed_detector} exists.")
-        return
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(
-            f"http://data.keithito.com/data/speech/{dataset_name}.tar.bz2",
-            filename=tar_path,
-            desc="Downloading LJSpeech",
-        )
+        return corpus_dir
+    resumable_download(
+        f"http://data.keithito.com/data/speech/{dataset_name}.tar.bz2",
+        filename=tar_path,
+        force_download=force_download,
+    )
     shutil.rmtree(corpus_dir, ignore_errors=True)
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=target_dir)
+        safe_extract(tar, path=target_dir)
     completed_detector.touch()
+
+    return corpus_dir
 
 
 def prepare_ljspeech(
@@ -71,7 +72,7 @@ def prepare_ljspeech(
     supervisions = []
     with open(metadata_csv_path) as f:
         for line in f:
-            recording_id, text, _ = line.split("|")
+            recording_id, text, normalized = line.split("|")
             audio_path = corpus_dir / "wavs" / f"{recording_id}.wav"
             if not audio_path.is_file():
                 logging.warning(f"No such file: {audio_path}")
@@ -86,6 +87,7 @@ def prepare_ljspeech(
                 language="English",
                 gender="female",
                 text=text,
+                custom={"normalized_text": normalized.strip()},
             )
             recordings.append(recording)
             supervisions.append(segment)
@@ -93,11 +95,12 @@ def prepare_ljspeech(
     recording_set = RecordingSet.from_recordings(recordings)
     supervision_set = SupervisionSet.from_segments(supervisions)
 
+    recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
     validate_recordings_and_supervisions(recording_set, supervision_set)
 
     if output_dir is not None:
-        supervision_set.to_json(output_dir / "supervisions.json")
-        recording_set.to_json(output_dir / "recordings.json")
+        supervision_set.to_file(output_dir / "ljspeech_supervisions_all.jsonl.gz")
+        recording_set.to_file(output_dir / "ljspeech_recordings_all.jsonl.gz")
 
     return {"recordings": recording_set, "supervisions": supervision_set}
 

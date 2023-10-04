@@ -31,7 +31,7 @@ from tqdm.auto import tqdm
 
 from lhotse import Recording, RecordingSet, SupervisionSegment, SupervisionSet
 from lhotse.qa import fix_manifests, validate_recordings_and_supervisions
-from lhotse.utils import Pathlike, check_and_rglob, urlretrieve_progress
+from lhotse.utils import Pathlike, check_and_rglob, resumable_download, safe_extract
 
 
 def prepare_callhome_english(
@@ -209,8 +209,12 @@ def prepare_callhome_english_asr(
         if output_dir is not None:
             output_dir = Path(output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
-            recordings.to_json(output_dir / f"recordings_{split}.json")
-            supervisions.to_json(output_dir / f"supervisions_{split}.json")
+            recordings.to_file(
+                output_dir / f"callhome-english_recordings_{split}.jsonl.gz"
+            )
+            supervisions.to_file(
+                output_dir / f"callhome-english_supervisions_{split}.jsonl.gz"
+            )
 
         manifests[split] = {"recordings": recordings, "supervisions": supervisions}
 
@@ -229,10 +233,9 @@ def download_callhome_metadata(
     target_dir.mkdir(parents=True, exist_ok=True)
     tar_name = "sre2000-key.tar.gz"
     tar_path = target_dir / tar_name
-    if force_download or not tar_path.is_file():
-        urlretrieve_progress(url, filename=tar_path, desc=f"Downloading {tar_name}")
+    resumable_download(url, filename=tar_path, force_download=force_download)
     with tarfile.open(tar_path) as tar:
-        tar.extractall(path=target_dir)
+        safe_extract(tar, path=target_dir)
     return sre_dir
 
 

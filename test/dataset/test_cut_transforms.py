@@ -1,12 +1,18 @@
 import random
 from math import isclose
 
+import numpy as np
 import pytest
 
 from lhotse import CutSet
 from lhotse.cut import MixedCut
-from lhotse.dataset import CutMix, ExtraPadding, PerturbTempo
-from lhotse.dataset import PerturbSpeed, PerturbVolume
+from lhotse.dataset import (
+    CutMix,
+    ExtraPadding,
+    PerturbSpeed,
+    PerturbTempo,
+    PerturbVolume,
+)
 from lhotse.testing.dummies import DummyManifest
 
 
@@ -59,7 +65,11 @@ def test_perturb_tempo(preserve_id: bool):
 @pytest.mark.parametrize("preserve_id", [False, True])
 def test_perturb_volume(preserve_id: bool):
     tfnm = PerturbVolume(
-        factors=[0.125, 2.0], p=0.5, randgen=random.Random(42), preserve_id=preserve_id
+        scale_low=0.125,
+        scale_high=2.0,
+        p=0.5,
+        randgen=random.Random(42),
+        preserve_id=preserve_id,
     )
     cuts = DummyManifest(CutSet, begin_id=0, end_id=10)
     cuts_vp = tfnm(cuts)
@@ -90,7 +100,7 @@ def test_cutmix(preserve_id: bool):
     for c in noise_cuts:
         c.duration = 1.5
 
-    tfnm = CutMix(noise_cuts, snr=None, prob=1.0, preserve_id=preserve_id)
+    tfnm = CutMix(noise_cuts, snr=None, p=1.0, preserve_id=preserve_id)
 
     tfnm_cuts = tfnm(speech_cuts)
     for c in tfnm_cuts:
@@ -106,6 +116,15 @@ def test_cutmix(preserve_id: bool):
         assert all(
             cut.id != cut_noisy.id for cut, cut_noisy in zip(speech_cuts, tfnm_cuts)
         )
+
+
+def test_cutmix_random_mix_offset():
+    speech_cuts = CutSet.from_json("test/fixtures/ljspeech/cuts.json").resample(16000)
+    noise_cuts = CutSet.from_json("test/fixtures/libri/cuts.json")
+    normal_tfnm = CutMix(noise_cuts, p=1.0)
+    random_tfnm = CutMix(noise_cuts, p=1.0, random_mix_offset=True)
+    for a, b in zip(normal_tfnm(speech_cuts), random_tfnm(speech_cuts)):
+        assert not np.array_equal(a.load_audio(), b.load_audio())
 
 
 @pytest.mark.parametrize("randomized", [False, True])

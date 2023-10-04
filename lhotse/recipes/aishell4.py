@@ -1,17 +1,17 @@
 """
-The AISHELL-4 is a sizable real-recorded Mandarin speech dataset collected by 8-channel 
-circular microphone array for speech processing in conference scenarios. The dataset 
-consists of 211 recorded meeting sessions, each containing 4 to 8 speakers, with a total 
-length of 120 hours. This dataset aims to bridge the advanced research on multi-speaker 
-processing and the practical application scenario in three aspects. With real recorded 
-meetings, AISHELL-4 provides realistic acoustics and rich natural speech characteristics 
-in conversation such as short pause, speech overlap, quick speaker turn, noise, etc. 
-Meanwhile, the accurate transcription and speaker voice activity are provided for each 
-meeting in AISHELL-4. This allows the researchers to explore different aspects in meeting 
-processing, ranging from individual tasks such as speech front-end processing, speech 
-recognition and speaker diarization, to multi-modality modeling and joint optimization 
-of relevant tasks. We also release a PyTorch-based training and evaluation framework as 
-a baseline system to promote reproducible research in this field. The baseline system 
+The AISHELL-4 is a sizable real-recorded Mandarin speech dataset collected by 8-channel
+circular microphone array for speech processing in conference scenarios. The dataset
+consists of 211 recorded meeting sessions, each containing 4 to 8 speakers, with a total
+length of 120 hours. This dataset aims to bridge the advanced research on multi-speaker
+processing and the practical application scenario in three aspects. With real recorded
+meetings, AISHELL-4 provides realistic acoustics and rich natural speech characteristics
+in conversation such as short pause, speech overlap, quick speaker turn, noise, etc.
+Meanwhile, the accurate transcription and speaker voice activity are provided for each
+meeting in AISHELL-4. This allows the researchers to explore different aspects in meeting
+processing, ranging from individual tasks such as speech front-end processing, speech
+recognition and speaker diarization, to multi-modality modeling and joint optimization
+of relevant tasks. We also release a PyTorch-based training and evaluation framework as
+a baseline system to promote reproducible research in this field. The baseline system
 code and generated samples are available at: https://github.com/felixfuyihui/AISHELL-4
 
 The dataset can be downloaded from: https://openslr.org/111/
@@ -27,6 +27,7 @@ is assigned a unique global_spk_id.
 """
 
 import logging
+import re
 import tarfile
 from collections import defaultdict
 from pathlib import Path
@@ -34,20 +35,52 @@ from typing import Dict, Optional, Union
 
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
-from lhotse.utils import Pathlike, urlretrieve_progress, is_module_available
+from lhotse.utils import Pathlike, is_module_available, resumable_download, safe_extract
+
+
+def text_normalize(line: str) -> str:
+    line = line.replace("<sil>", "")
+    line = line.replace("<%>", "")
+    line = line.replace("<->", "")
+    line = line.replace("<$>", "")
+    line = line.replace("<#>", "")
+    line = line.replace("<$>", "")
+    line = line.replace("<_>", "")
+    line = line.replace("<space>", "")
+    line = line.replace("`", "")
+    line = line.replace("&", "")
+    line = line.replace(",", "")
+    line = line.replace("\r", "")
+    line = line.replace("\n", "")
+    if re.search("[a-zA-Z]", line):
+        line = line.upper()
+    line = line.replace("Ａ", "A")
+    line = line.replace("ａ", "A")
+    line = line.replace("ｂ", "B")
+    line = line.replace("ｃ", "C")
+    line = line.replace("ｋ", "K")
+    line = line.replace("ｔ", "T")
+    line = line.replace("，", "")
+    line = line.replace("丶", "")
+    line = line.replace("。", "")
+    line = line.replace("、", "")
+    line = line.replace("？", "")
+    return line
 
 
 def download_aishell4(
     target_dir: Pathlike = ".",
     force_download: Optional[bool] = False,
     base_url: Optional[str] = "http://www.openslr.org/resources",
-) -> None:
+) -> Path:
     """
     Downdload and untar the dataset
     :param target_dir: Pathlike, the path of the dir to storage the dataset.
     :param force_download: Bool, if True, download the tars no matter if the tars exist.
     :param base_url: str, the url of the OpenSLR resources.
+    :return: the path to downloaded and extracted directory with data.
     """
     url = f"{base_url}/111"
     target_dir = Path(target_dir)
@@ -60,17 +93,19 @@ def download_aishell4(
     ]
     for tar_name in dataset_tar_names:
         tar_path = target_dir / tar_name
-        if force_download or not tar_path.is_file():
-            urlretrieve_progress(
-                f"{url}/{tar_name}", filename=tar_path, desc=f"Downloading {tar_name}"
-            )
+        resumable_download(
+            f"{url}/{tar_name}", filename=tar_path, force_download=force_download
+        )
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=target_dir)
+            safe_extract(tar, path=target_dir)
+
+    return target_dir
 
 
 def prepare_aishell4(
     corpus_dir: Pathlike,
     output_dir: Optional[Pathlike] = None,
+    normalize_text: bool = False,
 ) -> Dict[str, Dict[str, Union[RecordingSet, SupervisionSet]]]:
     """
     Returns the manifests which consist of the Recordings and Supervisions
@@ -129,20 +164,25 @@ def prepare_aishell4(
                             recording_id=idx,
                             start=start,
                             duration=round(end - start, 4),
-                            channel=0,
+                            channel=recording.channel_ids,
                             language="Chinese",
                             speaker=spk_id,
-                            text=text.strip(),
+                            text=text_normalize(text.strip())
+                            if normalize_text
+                            else text.strip(),
                         )
                         supervisions.append(segment)
 
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
+        recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
         validate_recordings_and_supervisions(recording_set, supervision_set)
 
         if output_dir is not None:
-            supervision_set.to_file(output_dir / f"supervisions_{part}.jsonl")
-            recording_set.to_file(output_dir / f"recordings_{part}.jsonl")
+            supervision_set.to_file(
+                output_dir / f"aishell4_supervisions_{part}.jsonl.gz"
+            )
+            recording_set.to_file(output_dir / f"aishell4_recordings_{part}.jsonl.gz")
 
         manifests[part] = {"recordings": recording_set, "supervisions": supervision_set}
 

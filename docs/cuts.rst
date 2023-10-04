@@ -41,9 +41,6 @@ There are three cut classes: :class:`~lhotse.cut.MonoCut`, :class:`~lhotse.cut.M
     :no-special-members:
     :noindex:
 
-Each of these types has additional attributes that are not common - e.g., it makes sense to specify *start* for
-:class:`MonoCut` to locate it in the source recording, but it is undefined for :class:`MixedCut` and :class:`PaddingCut`.
-
 CLI
 ***
 
@@ -53,7 +50,7 @@ Some examples of how to perform manipulations in the terminal:
 .. code-block:: bash
 
     # Reject short segments
-    lhotse yaml filter 'duration>=3.0' cuts.jsonl cuts-3s.jsonl
+    lhotse filter 'duration>=3.0' cuts.jsonl cuts-3s.jsonl
     # Pad short segments to 5 seconds.
     lhotse cut pad --duration 5.0 cuts-3s.jsonl cuts-5s-pad.jsonl
     # Truncate longer segments to 5 seconds.

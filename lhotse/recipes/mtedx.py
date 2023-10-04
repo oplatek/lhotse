@@ -39,11 +39,8 @@ from lhotse import (
     SupervisionSet,
     validate_recordings_and_supervisions,
 )
-from lhotse.qa import (
-    remove_missing_recordings_and_supervisions,
-    trim_supervisions_to_recordings,
-)
-from lhotse.utils import Pathlike, is_module_available, urlretrieve_progress
+from lhotse.qa import fix_manifests
+from lhotse.utils import Pathlike, is_module_available, resumable_download, safe_extract
 
 # Keep Markings such as vowel signs, all letters, and decimal numbers
 VALID_CATEGORIES = ("Mc", "Mn", "Ll", "Lm", "Lo", "Lt", "Lu", "Nd", "Zs")
@@ -79,7 +76,7 @@ ISOCODE2LANG = {
 def download_mtedx(
     target_dir: Pathlike = ".",
     languages: Optional[Union[str, Sequence[str]]] = "all",
-) -> None:
+) -> Path:
     """
     Download and untar the dataset.
 
@@ -89,6 +86,7 @@ def download_mtedx(
     :param: languages: A str or sequence of strings specifying which
         languages to download. The default 'all', downloads all available
         languages.
+    :return: the path to downloaded and extracted directory with data.
     """
     target_dir = Path(target_dir) / "mtedx_corpus"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -106,14 +104,14 @@ def download_mtedx(
         if completed_detector.is_file():
             logging.info(f"Skipping {lang} because {completed_detector} exists.")
             continue
-        urlretrieve_progress(
-            f"http://www.openslr.org/resources/100/mtedx_{lang}.tgz",
-            filename=tar_path,
-            desc=f"Downloading MTEDx {lang}",
+        resumable_download(
+            f"http://www.openslr.org/resources/100/mtedx_{lang}.tgz", filename=tar_path
         )
         with tarfile.open(tar_path) as tar:
-            tar.extractall(path=target_dir)
+            safe_extract(tar, path=target_dir)
         completed_detector.touch()
+
+    return target_dir
 
 
 ###############################################################################
@@ -225,10 +223,7 @@ def prepare_single_mtedx_language(
                 logging.warning(f"No supervisions found in {text_dir}")
             supervisions = SupervisionSet.from_segments(supervisions)
 
-            recordings, supervisions = remove_missing_recordings_and_supervisions(
-                recordings, supervisions
-            )
-            supervisions = trim_supervisions_to_recordings(recordings, supervisions)
+            recordings, supervisions = fix_manifests(recordings, supervisions)
             validate_recordings_and_supervisions(recordings, supervisions)
 
             manifests[split] = {
@@ -241,9 +236,11 @@ def prepare_single_mtedx_language(
                     output_dir = Path(output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 save_split = "dev" if split == "valid" else split
-                recordings.to_file(output_dir / f"recordings_{language}_{split}.json")
+                recordings.to_file(
+                    output_dir / f"mtedx-{language}_recordings_{split}.jsonl.gz"
+                )
                 supervisions.to_file(
-                    output_dir / f"supervisions_{language}_{split}.json"
+                    output_dir / f"mtedx-{language}_supervisions_{split}.jsonl.gz"
                 )
 
     return dict(manifests)

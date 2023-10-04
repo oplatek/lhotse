@@ -2,10 +2,11 @@ from tempfile import NamedTemporaryFile
 
 import numpy as np
 import pytest
+from pytest import approx
 
 from lhotse.audio import AudioSource, Recording, RecordingSet
 from lhotse.cut import CutSet, MonoCut
-from lhotse.features import FeatureSet, Features
+from lhotse.features import Features, FeatureSet
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.testing.dummies import dummy_cut, dummy_supervision
 
@@ -69,6 +70,32 @@ def test_num_frames(libri_cut):
     assert libri_cut.num_frames == expected_cut_frame_count
 
 
+def test_cut_into_windows():
+    cuts0 = CutSet.from_json(
+        "test/fixtures/ljspeech/cuts.json"
+    )  # has 2 cuts of 1.54s and 1.6s
+    cuts = cuts0.cut_into_windows(duration=0.5, hop=0.4)  # 0, 0.4, 0.8, 1.2
+    starts = [cut.start for cut in cuts]
+    assert starts == approx([0, 0.4, 0.8, 1.2, 0, 0.4, 0.8, 1.2])
+    durations = [cut.duration for cut in cuts]
+    assert durations == approx(
+        [0.5, 0.5, 0.5, 0.3396371882, 0.5, 0.5, 0.5, 0.39768707483]
+    )
+
+
+def test_cut_into_windows_parallel():
+    cuts0 = CutSet.from_json(
+        "test/fixtures/ljspeech/cuts.json"
+    )  # has 2 cuts of 1.54s and 1.6s
+    cuts = cuts0.cut_into_windows(duration=0.5, hop=0.4, num_jobs=2)  # 0, 0.4, 0.8, 1.2
+    starts = [cut.start for cut in cuts]
+    assert starts == approx([0, 0.4, 0.8, 1.2, 0, 0.4, 0.8, 1.2])
+    durations = [cut.duration for cut in cuts]
+    assert durations == approx(
+        [0.5, 0.5, 0.5, 0.3396371882, 0.5, 0.5, 0.5, 0.39768707483]
+    )
+
+
 def test_load_features(libri_cut):
     feats = libri_cut.load_features()
     assert feats.shape[0] == libri_cut.num_frames
@@ -81,9 +108,10 @@ def test_load_none_features(libri_cut):
     assert feats is None
 
 
-def test_store_audio(libri_cut):
-    with NamedTemporaryFile() as f:
-        stored_cut = libri_cut.compute_and_store_recording(f.name)
+@pytest.mark.parametrize("ext", [".wav", ".flac"])
+def test_save_audio(libri_cut, ext):
+    with NamedTemporaryFile(suffix=ext) as f:
+        stored_cut = libri_cut.save_audio(f.name)
         samples1 = libri_cut.load_audio()
         rec = Recording.from_file(f.name)
         samples2 = rec.load_audio()
@@ -223,25 +251,25 @@ def test_make_cuts_from_features_recordings(dummy_recording_set, dummy_feature_s
 def test_make_cuts_from_recordings_with_deterministic_ids(dummy_recording_set):
     cut_set = CutSet.from_manifests(recordings=dummy_recording_set, random_ids=False)
     for idx, cut in enumerate(cut_set):
-        assert cut.id == f"{cut.recording_id}-{idx}-{cut.channel}"
+        assert cut.id == f"{cut.recording_id}-{idx}"
 
 
 def test_make_cuts_from_recordings_with_random_ids(dummy_recording_set):
     cut_set = CutSet.from_manifests(recordings=dummy_recording_set, random_ids=True)
     for idx, cut in enumerate(cut_set):
-        assert cut.id != f"{cut.recording_id}-{idx}-{cut.channel}"
+        assert cut.id != f"{cut.recording_id}-{idx}"
 
 
 def test_make_cuts_from_features_with_deterministic_ids(dummy_feature_set):
     cut_set = CutSet.from_manifests(features=dummy_feature_set, random_ids=False)
     for idx, cut in enumerate(cut_set):
-        assert cut.id == f"{cut.recording_id}-{idx}-{cut.channel}"
+        assert cut.id == f"{cut.recording_id}-{idx}"
 
 
 def test_make_cuts_from_features_with_random_ids(dummy_feature_set):
     cut_set = CutSet.from_manifests(features=dummy_feature_set, random_ids=True)
     for idx, cut in enumerate(cut_set):
-        assert cut.id != f"{cut.recording_id}-{idx}-{cut.channel}"
+        assert cut.id != f"{cut.recording_id}-{idx}"
 
 
 class TestCutOnSupervisions:
@@ -696,3 +724,32 @@ class TestCreateCutSetLazy:
             assert cut1.num_frames == 1000
             assert cut1.num_features == 23
             assert cut1.features_type == "fbank"
+
+
+def test_cut_has_overlapping_supervisions_false():
+    cut = MonoCut(
+        "id",
+        start=0,
+        duration=10,
+        channel=0,
+        supervisions=[
+            dummy_supervision(0, start=0, duration=1),
+            dummy_supervision(0, start=5, duration=1),
+        ],
+    )
+    assert not cut.has_overlapping_supervisions
+
+
+@pytest.mark.parametrize("start", [0, 0.0001, 0.5, 0.99999])
+def test_cut_has_overlapping_supervisions_true(start):
+    cut = MonoCut(
+        "id",
+        start=0,
+        duration=10,
+        channel=0,
+        supervisions=[
+            dummy_supervision(0, start=0, duration=1),
+            dummy_supervision(0, start=start, duration=1),
+        ],
+    )
+    assert cut.has_overlapping_supervisions

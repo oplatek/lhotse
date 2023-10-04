@@ -3,22 +3,22 @@ Data preparation recipe for CMU Kids corpus (https://catalog.ldc.upenn.edu/LDC97
 
 Summary of corpus from LDC webpage:
 
-This database is comprised of sentences read aloud by children. It was originally designed 
-in order to create a training set of children's speech for the SPHINX II automatic speech 
+This database is comprised of sentences read aloud by children. It was originally designed
+in order to create a training set of children's speech for the SPHINX II automatic speech
 recognizer for its use in the LISTEN project at Carnegie Mellon University.
 
-The children range in age from six to eleven (see details below) and were in first through 
-third grades (the 11-year-old was in 6th grade) at the time of recording. There were 24 male 
+The children range in age from six to eleven (see details below) and were in first through
+third grades (the 11-year-old was in 6th grade) at the time of recording. There were 24 male
 and 52 female speakers. There are 5,180 utterances in all.
 
 The speakers come from two separate populations:
 
- 1. SIM95: They were recorded in the summer of 1995 and were enrolled in either the Chatham 
-    College Summer Camp or the Mount Lebanon Extended Day Summer Fun program in Pittsburgh. 
+ 1. SIM95: They were recorded in the summer of 1995 and were enrolled in either the Chatham
+    College Summer Camp or the Mount Lebanon Extended Day Summer Fun program in Pittsburgh.
     They were recorded on-site. There are 44 speakers and 3,333 utterances in this set. They
     "good" reading examples.
- 2. FP: These are examples of errorful reading and dialectic variants. The readers come from 
-    Fort Pitt School in Pittsburgh and were recorded in April 1996. There are 32 speakers and 
+ 2. FP: These are examples of errorful reading and dialectic variants. The readers come from
+    Fort Pitt School in Pittsburgh and were recorded in April 1996. There are 32 speakers and
     1,847 utterances in this set.
 
 The user should be aware that the speakers' dialect partly reflects what is locally called "Pittsburghese."
@@ -36,6 +36,7 @@ from typing import Dict, Optional, Union
 
 from lhotse import validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
+from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.utils import Pathlike
 
@@ -129,6 +130,7 @@ def prepare_cmu_kids(
     recordings = RecordingSet.from_recordings(recordings)
     supervisions = SupervisionSet.from_segments(supervisions)
 
+    recordings, supervisions = fix_manifests(recordings, supervisions)
     validate_recordings_and_supervisions(recordings, supervisions)
 
     manifests = {
@@ -137,10 +139,12 @@ def prepare_cmu_kids(
     }
 
     if output_dir is not None:
-        logging.info("Writing manifests to JSON files")
+        logging.info("Writing manifests to JSONL files")
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        manifests["recordings"].to_json(output_dir / "recordings.json")
-        manifests["supervisions"].to_json(output_dir / "supervisions.json")
+        manifests["recordings"].to_file(output_dir / "cmu-kids_recordings_all.jsonl.gz")
+        manifests["supervisions"].to_file(
+            output_dir / "cmu-kids_supervisions_all.jsonl.gz"
+        )
 
     return manifests
